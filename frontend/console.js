@@ -28,7 +28,7 @@
     if (/\[TOOL\]/.test(text)) return "tool";
     if (/\[Watcher\]/.test(text)) return "watcher";
     if (/\[STAGE\]|\[Session\]/.test(text)) return "stage";
-    if (/\[Claude\]/.test(text)) return "claude";
+    if (/\[Agent\]/.test(text)) return "agent";
     return "";
   }
 

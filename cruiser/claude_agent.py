@@ -1013,7 +1013,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
                     if text.strip():
                         # collapse to one line so JSON inside a Thought is not misread line-by-line by the parent process as the final {"flag"}
                         preview = text.strip()[:300].replace("\n", " ").replace("\r", " ")
-                        print(f"[Claude] {preview}", flush=True)
+                        print(f"[Agent] {preview}", flush=True)
                 digest_parts = []
                 if text.strip():
                     digest_parts.append("Thought: " + text.strip()[:_WATCHER_THOUGHT_CHARS])
@@ -1050,7 +1050,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
                 # session ended (success / error_max_turns / error_*)
                 if not quiet:
                     subtype = evt.get("subtype") or ""
-                    print(f"[Session] Claude session ended: {subtype}", flush=True)
+                    print(f"[Session] session ended: {subtype}", flush=True)
                 break
     finally:
         if proc.poll() is None:

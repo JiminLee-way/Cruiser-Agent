@@ -706,7 +706,7 @@ The system also emits structured stdout markers, which are easy to save with `te
 | Marker | Meaning |
 |--------|---------|
 | `[COUNT] N` | Step count increasing monotonically across sessions (the basis for scheduling thresholds) |
-| `[TOOL] ...` / `[Claude] ...` | Summaries of tool calls and model text |
+| `[TOOL] ...` / `[Agent] ...` | Summaries of tool calls and model text |
 | `[Watcher] session X blackboard: added/updated/removed` | Blackboard curation actions |
 | `[Watcher] session X task board: published/retired` | Task board changes |
 | `[Stage-Preprocess/Tier1/Tier2/Tier3]` | Tiered scheduling events |
