@@ -716,6 +716,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     tools_dir = os.path.join(root, "tools")
     submit_cmd = f'"{sys.executable}" {os.path.join(tools_dir, "submit_flag.py")}'
     dirsearch_cmd = f'"{sys.executable}" {os.path.join(tools_dir, "dirsearch_scan.py")}'
+    report_cmd = f'"{sys.executable}" {os.path.join(tools_dir, "task_board.py")} report {code} {worker_id}'
     decompile_script = os.path.join(tools_dir, "decompile.py")
     res_dir = os.path.join(root, "resource")
     if solver_task:
@@ -727,6 +728,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
             task=solver_task,
             info_file=os.path.join(reports_dir, f"info_{code}.txt"),
             submit_cmd=submit_cmd,
+            report_cmd=report_cmd,
             res_dir=res_dir,
             decompile_script=decompile_script,
             dirsearch_cmd=dirsearch_cmd,
@@ -785,9 +787,10 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     flag_json = _drive_session(proc, events, code, worker_id, quiet, step_counter, session)
     if resume_id and session["steps"] == 0 and not flag_json:
         ledger.session_clear(code, slot)  # resume produced nothing: start the next session fresh
-    if solver_task and session["last_text"].strip():
-        # The solver's closing message is its task result: it goes back to the ledger, not into thin air.
-        ledger.add_result(code, worker_id, solver_task, redact(session["last_text"].strip())[:1500])
+    if solver_task and not flag_json and session["last_text"].strip() and not ledger.has_result(code, worker_id, solver_task):
+        # the closing message stands in for a conclusion the solver did not report itself
+        from .taskboard import report_task
+        report_task(code, worker_id, session["last_text"], task=solver_task)
     return flag_json
 
 

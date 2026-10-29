@@ -286,6 +286,12 @@ def add_result(code: str, author: str, task: str, text: str) -> Optional[str]:
     return _commit(code, lambda led: led.add(author, "result", text, task))
 
 
+def has_result(code: str, author: str, task: str) -> bool:
+    """Whether author ever reported a result for task (superseded results count)."""
+    task = _clean(task, _TASK_CAP)
+    return any(e["kind"] == "result" and e["author"] == author and e.get("task") == task for e in _load(code).entries)
+
+
 def set_status(code: str, entry_id: str, status: str, note: str = "", by: str = "") -> bool:
     """Move a fact or result along _NEXT. False (and nothing written) for an unknown id or status, a
     [flag-method], a forbidden move, or a repeat of the current status without a new note."""

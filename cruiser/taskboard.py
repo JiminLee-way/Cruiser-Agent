@@ -210,6 +210,10 @@ def retire_task(code: str, ref: str) -> bool:
 
 
 def report_task(code: str, worker_id: str, text: str, task: str = "") -> bool:
-    """Report completion: written to the shared ledger (cruiser.ledger) as a task result, and shown in the blackboard view and the watcher input."""
+    """Report completion as a task result in the shared ledger (cruiser.ledger). Without a task, the result
+    belongs to the reporter's newest claim."""
     from . import ledger
+    if not task:
+        mine = [c["text"] for c in list_claimed(code) if c["worker"] == worker_id]
+        task = mine[-1] if mine else ""
     return ledger.add_result(code, worker_id, task, text) is not None

@@ -624,14 +624,15 @@ def main():
                             worker_procs.discard(p)
                 # refill: claim new tasks FIFO (claiming erases the task, so deduplication is built in)
                 while len(active) < MAX_SOLVERS_PER_CHALLENGE and not _solver_stage_over(grp):
+                    sid = sid_seq + 1
                     try:
-                        claimed = claim_task(code, f"solver")
+                        # claim under the worker id the solver will run as, so its report finds the claim
+                        claimed = claim_task(code, f"solver{sid}")
                     except Exception:
                         claimed = None
                     if not claimed:
                         break
-                    sid_seq += 1
-                    sid = sid_seq
+                    sid_seq = sid
                     try:
                         p = spawn_solver(code, target, claimed["text"], sid)
                     except Exception as e:
