@@ -25,10 +25,10 @@ STUB = textwrap.dedent('''\
     #!{python}
     import json, os, re, subprocess, sys
     args = sys.argv[1:]
-    prompt = args[args.index("-p") + 1]
+    instructions = " ".join(args)
     code = os.environ["CRUISER_CHALLENGE_CODE"]
     flag = os.environ["STUB_FLAG"]
-    m = re.search(r'("[^"]+" \\S+submit_flag\\.py)', prompt)
+    m = re.search(r'("[^"]+" \\S+submit_flag\\.py)', instructions)
     cmd = f"{{m.group(1)}} {{code}} '{{flag}}'"
 
     def emit(obj):

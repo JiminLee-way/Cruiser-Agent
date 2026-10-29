@@ -67,7 +67,7 @@ def test_solver_closing_message_is_recorded_only_when_it_did_not_report(
     stub.write_text(STUB.format(report=reports_itself))
     fake = SimpleNamespace(
         NAME="stub", BINARY_NAME=sys.executable,
-        session_cmd=lambda prompt, *a, **kw: [sys.executable, str(stub), prompt],
+        session_cmd=lambda prompt, system_prompt, *a, **kw: [sys.executable, str(stub), system_prompt + "\n" + prompt],
         claude_events=claude_agent._claude_events,
     )
     monkeypatch.setattr(engines, "current", lambda: fake)
@@ -82,3 +82,32 @@ def test_solver_closing_message_is_recorded_only_when_it_did_not_report(
     results = ledger.results("T-1")
     assert [r["text"] for r in results] == expected
     assert [r["task"] for r in results] == [task]
+
+
+def test_session_log_tags_model_text_as_agent(repo_copy, tmp_path, monkeypatch, capsys):
+    reports = repo_copy / "reports"
+    monkeypatch.setattr(ledger, "_reports_dir", lambda: str(reports))
+    monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: None)
+    monkeypatch.chdir(repo_copy)
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "reading the grid\nnext line"}]}},
+        {"type": "result", "subtype": "success"},
+    ]
+    emit = "import json; " + "; ".join(f"print(json.dumps({e!r}))" for e in events)
+    fake = SimpleNamespace(
+        NAME="stub", BINARY_NAME=sys.executable,
+        session_cmd=lambda *a, **kw: [sys.executable, "-c", emit],
+        claude_events=claude_agent._claude_events,
+    )
+    monkeypatch.setattr(engines, "current", lambda: fake)
+    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    claude_agent._run_one_session("http://t", "", "T-1", "2", str(ws), False, [0])
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "[Agent] reading the grid next line" in lines
+    assert "[Session] session ended: success" in lines
+    assert not any("Claude" in ln for ln in lines)

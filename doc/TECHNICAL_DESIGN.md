@@ -225,7 +225,7 @@ Cruiser/
 │   ├── runtime.py           # Scheduler runtime snapshot (read by the dashboard)
 │   ├── taskboard.py         # Task board read/write (file lock + atomic rewrite)
 │   ├── llm.py               # LLM provider registry and routing (DeepSeek / Kimi / GLM)
-│   ├── prompt.py            # System prompts and task templates
+│   ├── prompt.py            # Prompt parts table and per-role assembly
 │   └── tools.py             # submit_flag, dirsearch/xss and other tools
 ├── resource/                # Username/password/XSS payload/flag clue wordlists
 ├── kb/                      # Offline vulnerability knowledge base (git submodules: vulhub / nuclei-templates / PayloadsAllTheThings; download the nuclei binary yourself)
@@ -260,7 +260,7 @@ The main process is the **only process that manages target lifecycles** (workers
 
 A worker is a copy of `main.py` itself; because it carries `CRUISER_WORKER_ID`, it skips the startup self-check and calls `cruiser.claude_agent.run_auto_scan()` directly:
 
-1. Picks the system prompt and task template depending on whether a `solver_task` is given (regular exploration / directed solver mode);
+1. Picks the role (solver when a `solver_task` is given, lead for session 1, explorer otherwise) and assembles its system prompt and task prompt with `cruiser.prompt.build` (see §3.4);
 2. Writes `.claude/settings.json` into the workspace to register the blackboard hooks (see §5.2);
 3. Launches the `claude` CLI subprocess (**without** `start_new_session`, so it stays in this process group and is reaped together when the scheduler calls `killpg`);
 4. Parses the stream-json event stream line by line:
@@ -284,11 +284,15 @@ claude -p "<task prompt>" \
 
 Design points:
 
-- **No web search**: following common CTF rules against searching online, `WebSearch`/`WebFetch` are explicitly removed from the tool set (in headless mode `bypassPermissions` would allow them automatically, so they must be disabled explicitly).
-- **System prompt** (`cruiser/prompt.py`): positions the agent as a "Web vulnerability + logic vulnerability" solving expert, covering how to recognize and exploit SQL injection, XSS (the goal is an alert popup with the string `XSS`), CSRF, file inclusion, file upload, broken access control, race conditions, business logic, and other categories, with built-in engineering rules:
-  - Batch/concurrency strategy: brute-force and enumeration tasks must be scripted or run concurrently with `seq | xargs -P N`; trying requests one at a time by hand is forbidden;
-  - Tool discipline: run `-h/--help` before calling a security tool; directory scans must go through the `dirsearch_scan` tool (deduplicated across sessions + report saved to disk, to avoid context overflow); flags may only be submitted through the `submit_flag` tool;
-  - Saving artifacts to disk: large output is written to `$CRUISER_WORKSPACE_DIR` and then read and filtered, to avoid blowing up the context.
+- **No web search**: the core rules forbid looking the challenge or its writeups up online, so `WebSearch`/`WebFetch` are explicitly removed from the tool set (in headless mode `bypassPermissions` would allow them automatically, so they must be disabled explicitly).
+- **Prompt assembly** (`cruiser/prompt.py`): a prompt is a list of named parts from `PARTS`, picked per role in `ROLES`, not one edited string. Every role gets the same first three parts, then its own role part:
+  - `core`: solve an offline puzzle until the verifier accepts the answer; work only inside the working directory; treat a claim as a fact only after checking it by running code against the real artifact; no online lookup of the challenge or its writeups (installing packages is fine); write large output to a file and filter it; write every message, report and shared note in English;
+  - `verifier`: the `tools/submit_flag.py` command, `FLAG CORRECT` / `ALREADY SUBMITTED` as the only acceptance, and `flag progress X/Y` for multi-answer challenges;
+  - `ledger`: read the shared ledger and never edit it, and record a conclusion with `tools/task_board.py report ... --basis <ids>`;
+  - role part: `explorer` (sessions 2..N), `lead` (session 1, also re-sent on resume) or `solver` (one direction from the task board);
+  - `skills`: added only when the session's working root (`CRUISER_CODEX_ROOT` under codex, otherwise the workspace) contains `skills/`; it points the agent at `skills/solve-challenge/SKILL.md`, from which it opens category skills on demand.
+
+  The parts carry no category techniques and no tool list. The challenge facts (code, target, hint or direction) go in the task prompt.
 - **Context window management**: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 1,000,000) declares the real window, and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (default 800,000) triggers auto-compact early, leaving headroom before the hard limit.
 
 ---
@@ -465,7 +469,7 @@ Key parameters and rules:
 Besides the regular exploration workers, each challenge has a `solver_driver` thread:
 
 - It keeps ≤ `CRUISER_MAX_SOLVERS` (default 3) concurrent solvers;
-- Each solver **claims one direction FIFO** from the task board and starts a directed session with a focused system prompt (`CLAUDE_SOLVER_SYSTEM_PROMPT` + task template), with a turn limit of `CRUISER_SOLVER_MAX_TURNS` (default 40) and model `CRUISER_SOLVER_MODEL` (default `deepseek-v4-flash`);
+- Each solver **claims one direction FIFO** from the task board and starts a directed session with the solver prompt (the `solver` role in `cruiser/prompt.py`), with a turn limit of `CRUISER_SOLVER_MAX_TURNS` (default 40) and model `CRUISER_SOLVER_MODEL` (default `deepseek-v4-flash`);
 - When a solver exits, its slot is reclaimed and refilled; when the challenge's flag is found or the round ends, all solvers are stopped and killed;
 - How it relates to the exploration workers: exploration workers cast a wide net, find things naturally, and write the blackboard; the watcher makes "worth digging into but not yet done" directions explicit on the task board; solvers take tasks on demand for directed breakthroughs. Together the three form an "explore → curate → attack" loop.
 
@@ -628,7 +632,7 @@ The `list_security_tools` tool lets the agent discover which security tools and 
 
 ### 10.3 Offline knowledge base and wordlists
 
-- `kb/`: three git submodules ([vulhub](https://github.com/vulhub/vulhub) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) / [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)); clone with `--recurse-submodules`. `kb/bin/nuclei` exceeds GitHub's per-file limit, so download it yourself from [Releases](https://github.com/projectdiscovery/nuclei/releases). `CRUISER_KB_DIR` can override the path. Combined with the no-network rule, all intelligence sources are local;
+- `kb/`: three git submodules ([vulhub](https://github.com/vulhub/vulhub) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) / [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)); clone with `--recurse-submodules`. `kb/bin/nuclei` exceeds GitHub's per-file limit, so download it yourself from [Releases](https://github.com/projectdiscovery/nuclei/releases). Combined with the no-network rule, all intelligence sources are local;
 - `resource/`: the `username.txt` / `password.txt` / `xss.txt` wordlists and `flag_hunting.txt` (a checklist of flag locations).
 
 ---
@@ -706,7 +710,7 @@ The system also emits structured stdout markers, which are easy to save with `te
 | Marker | Meaning |
 |--------|---------|
 | `[COUNT] N` | Step count increasing monotonically across sessions (the basis for scheduling thresholds) |
-| `[TOOL] ...` / `[Claude] ...` | Summaries of tool calls and model text |
+| `[TOOL] ...` / `[Agent] ...` | Summaries of tool calls and model text |
 | `[Watcher] session X blackboard: added/updated/removed` | Blackboard curation actions |
 | `[Watcher] session X task board: published/retired` | Task board changes |
 | `[Stage-Preprocess/Tier1/Tier2/Tier3]` | Tiered scheduling events |
@@ -781,7 +785,7 @@ uv run pytest
 1. **Hard dependency on the `claude` CLI**: the engine is built on its stream-json protocol and hook mechanism, so CLI upgrades need regression testing.
 2. **Local resource limits**: compose targets and multi-session workers all run on the local machine, so setting `CRUISER_MAX_ACTIVE` too high causes resource contention; you must avoid port conflicts in compose challenges' `addresses` yourself.
 3. **Hint policy**: giving hints only from tier 3 onward is a deliberate trade-off (black-box first, then hints); if you never want the agent to see a hint, just leave `hint` out.
-4. **Black-box only**: the current flow is black-box throughout (no source-audit channel); challenges that need source help rely on the agent reading source from the target itself (the prompt already says to read source first after file inclusion/command execution).
+4. **Black-box only**: the current flow is black-box throughout (no source-audit channel); challenges that need source help rely on the agent reading source from the target itself.
 5. **Watcher cost**: by default one pro-class model call every 4 steps, so token cost grows linearly with the number of sessions (thin it out with `CRUISER_WATCHER_EVERY`).
 6. **File bus scale**: each challenge's blackboard relies on watcher curation to stay small; in extremely long sessions it can still grow, and the injection side's last-3000-character truncation is the fallback.
 
@@ -813,7 +817,7 @@ uv run pytest
 | `cruiser/runtime.py` | Scheduler runtime snapshot and `reports/` assembly |
 | `cruiser/llm.py` | LLM provider registry, model routing, temperature sharding |
 | `cruiser/taskboard.py` | Task board publish/claim/report/retire (file lock + atomic rewrite + similarity dedup) |
-| `cruiser/prompt.py` | System prompts and task templates (two sets: exploration / solver) |
+| `cruiser/prompt.py` | Prompt parts table and per-role assembly (explorer / lead / solver) |
 | `cruiser/tools.py` | Implementations of submit_flag, dirsearch, XSS fuzz and other tools |
 | `blackboard_hook.py` | SessionStart / PostToolUse hard context injection hooks |
 | `kill_orphans.py` | Fallback cleanup for dangling processes |
