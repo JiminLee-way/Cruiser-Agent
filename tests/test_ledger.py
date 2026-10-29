@@ -183,7 +183,6 @@ def test_engines_announce_session_ids(monkeypatch):
 def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, monkeypatch):
     from cruiser import claude_agent, taskboard
     monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
-    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)

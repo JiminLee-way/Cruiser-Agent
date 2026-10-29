@@ -21,7 +21,6 @@ def reports(tmp_path, monkeypatch):
 
 @pytest.fixture
 def run_watcher(reports, tmp_path, monkeypatch):
-    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)

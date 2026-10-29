@@ -535,8 +535,6 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None
     try:
         from . import ledger
         from .taskboard import list_claimed, list_tasks
-        # watcher fallback submission: runs before curation, so it can submit even without a usable watcher LLM
-        _watcher_try_submit_flags(code, worker_id, activity)
         llm = _get_watcher_llm()
         if llm is None:
             return
@@ -971,12 +969,16 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
         if start:
             threading.Thread(target=_watcher_job, args=(snapshot,), daemon=True).start()
 
+    def _watcher_cycle(snapshot: str) -> None:
+        try:
+            _watcher_try_submit_flags(code, worker_id, snapshot)
+            _watcher_curate_blackboard(code, worker_id, snapshot)
+        except Exception:
+            pass
+
     def _watcher_job(snapshot: str) -> None:
         while True:
-            try:
-                _watcher_curate_blackboard(code, worker_id, snapshot)
-            except Exception:
-                pass
+            _watcher_cycle(snapshot)
             with watcher_lock:
                 snapshot = watcher_state["pending"]
                 watcher_state["pending"] = None
@@ -1065,9 +1067,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
         if code and recent:
             snapshot = _format_watcher_activity(recent)
             try:
-                ft = threading.Thread(
-                    target=_watcher_curate_blackboard, args=(code, worker_id, snapshot), daemon=True
-                )
+                ft = threading.Thread(target=_watcher_cycle, args=(snapshot,), daemon=True)
                 ft.start()
                 ft.join(timeout=30)
             except Exception:
