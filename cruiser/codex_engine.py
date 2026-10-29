@@ -150,14 +150,14 @@ class _Reply:
 class WatcherLLM:
     """One-shot call for the watcher / [flag-method] writer: read-only sandbox, invoke(messages) -> obj.content."""
 
-    def __init__(self, model: Optional[str] = None, timeout_s: float = 300.0):
+    def __init__(self, workspace: str, model: Optional[str] = None, timeout_s: float = 300.0):
+        self.workspace = workspace
         self.model = model or watcher_model()
         self.timeout_s = timeout_s
 
     def invoke(self, messages) -> _Reply:
         prompt = "\n\n".join(str(getattr(m, "content", m)) for m in messages)
-        cwd = os.environ.get("CRUISER_WORKSPACE_DIR") or os.getcwd()
-        cmd = _base_cmd(self.model) + ["-s", "read-only", "-C", cwd, prompt]
+        cmd = _base_cmd(self.model) + ["-s", "read-only", "-C", self.workspace, prompt]
         try:
             out = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=self.timeout_s,

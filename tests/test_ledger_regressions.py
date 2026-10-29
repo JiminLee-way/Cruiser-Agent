@@ -21,7 +21,6 @@ def reports(tmp_path, monkeypatch):
 
 @pytest.fixture
 def run_watcher(reports, tmp_path, monkeypatch):
-    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
@@ -31,8 +30,8 @@ def run_watcher(reports, tmp_path, monkeypatch):
             def invoke(self, messages):
                 return SimpleNamespace(content=json.dumps(reply))
 
-        monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
-        claude_agent._watcher_curate_blackboard(CODE, worker_id, "Thought: checked the table\nAction: shell: ls")
+        monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+        claude_agent._watcher_curate_blackboard(CODE, worker_id, "Thought: checked the table\nAction: shell: ls", str(cwd))
 
     return _run
 

@@ -15,5 +15,5 @@ def current() -> Optional[ModuleType]:
 
 
 def child_env(cwd: str, base: Optional[dict] = None) -> dict:
-    """Environment for a child started with cwd=cwd: opencode resolves its directory from $PWD, not the process cwd."""
-    return {**(os.environ if base is None else base), "PWD": cwd}
+    """opencode resolves its directory from $PWD, not the process cwd."""
+    return {**(os.environ if base is None else base), "PWD": cwd, "CRUISER_WORKSPACE_DIR": cwd}

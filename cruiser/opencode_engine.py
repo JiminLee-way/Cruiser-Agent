@@ -135,7 +135,8 @@ class _Reply:
 class OpencodeLLM:
     """One-shot call for the watcher / [flag-method] writer: invoke(messages) -> obj.content."""
 
-    def __init__(self, model: Optional[str] = None, timeout_s: float = 240.0):
+    def __init__(self, workspace: str, model: Optional[str] = None, timeout_s: float = 240.0):
+        self.workspace = workspace
         self.model = model or watcher_model()
         self.timeout_s = timeout_s
 
@@ -143,10 +144,10 @@ class OpencodeLLM:
         from .engines import child_env
         prompt = "\n\n".join(str(getattr(m, "content", m)) for m in messages)
         cmd = [binary(), "run", "--standalone", "--format", "json", "-m", self.model, prompt]
-        cwd = os.environ.get("CRUISER_WORKSPACE_DIR") or os.getcwd()
         try:
             out = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.timeout_s, cwd=cwd, env=child_env(cwd),
+                cmd, capture_output=True, text=True, timeout=self.timeout_s,
+                cwd=self.workspace, env=child_env(self.workspace),
             ).stdout
         except Exception:
             return _Reply("")

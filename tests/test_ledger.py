@@ -41,6 +41,19 @@ def test_duplicates_and_unknown_ids_are_rejected(reports):
     assert not ledger.set_status("T-1", ledger.facts("T-1")[0]["id"], "deleted")
 
 
+def test_one_flag_method_per_flag_number_and_text_duplicates_are_per_kind_group(reports):
+    assert ledger.add_fact("T-1", "1", "progress 1/2. sqli on /login", kind="flag_method")
+    assert ledger.add_fact("T-1", "2", "progress 1/2. ssti on /render", kind="flag_method") is None
+    assert ledger.add_fact("T-1", "2", "progress 2/2. ssti on /render", kind="flag_method")
+    assert ledger.add_fact("T-1", "3", "flag 1 came from sqli on /login")
+    assert ledger.add_fact("T-1", "3", "PROGRESS 1/2.  sqli on /login") is None
+    assert ledger.add_result("T-1", "s1", "check the cookie", "progress 1/2. sqli on /login")
+    assert ledger.add_result("T-1", "s2", "check the cookie", "progress 1/2. sqli on /login") is None
+    assert ledger.add_result("T-1", "s2", "check the login form", "progress 1/2. sqli on /login")
+    assert [f["kind"] for f in ledger.facts("T-1")] == ["flag_method", "flag_method", "fact"]
+    assert [r["task"] for r in ledger.results("T-1")] == ["check the cookie", "check the login form"]
+
+
 def test_board_uses_parseable_header_format(reports):
     ledger.add_fact("T-1", "solver3", "fact one")
     ledger.add_result("T-1", "solver3", "check the table", "table is only a UI legend")
@@ -170,7 +183,6 @@ def test_engines_announce_session_ids(monkeypatch):
 def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, monkeypatch):
     from cruiser import claude_agent, taskboard
     monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
-    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
@@ -192,8 +204,8 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
                 content = json.dumps(reply)
             return R()
 
-    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
-    claude_agent._watcher_curate_blackboard("T-1", claude_agent.LEAD_SLOT, "Thought: tried things\nAction: shell: ls")
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+    claude_agent._watcher_curate_blackboard("T-1", claude_agent.LEAD_SLOT, "Thought: tried things\nAction: shell: ls", str(cwd))
     by_id = {f["id"]: f for f in ledger.facts("T-1")}
     assert by_id[lead]["status"] == "disputed" and "0xab5e313b" in by_id[lead]["text"]
     assert by_id[keep]["status"] == "verified"
