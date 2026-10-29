@@ -331,6 +331,10 @@ def digest(code: str) -> str:
     return (_load_or_empty(code).digest or {}).get("text", "")
 
 
+def digest_ts(code: str) -> str:
+    return (_load_or_empty(code).digest or {}).get("ts", "")
+
+
 def _fit_context(digest_text: str, lines: list[str], budget: int) -> tuple[str, int]:
     lines = [ln[:_LINE_CAP] for ln in lines]
     gap = "\n\n"

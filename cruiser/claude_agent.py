@@ -157,6 +157,7 @@ _WATCHER_SYSTEM = (
 )
 
 _WATCHER_PROMPT_TEMPLATE = (
+    "{new_since}"
     "[Ledger entries (id status author content)]\n{blackboard}\n\n"
     "[Directed task results (id status author direction -> conclusion)]\n{results}\n\n"
     "[Exploration directions currently waiting to be claimed]\n{tasks}\n"
@@ -189,6 +190,12 @@ _WATCHER_PROMPT_TEMPLATE = (
 )
 
 _WATCHER_NO_DIGEST = "\nThe solve-state digest is maintained by the lead session's watcher: always return digest as an empty string."
+_WATCHER_DIGEST_RULES = (
+    "\nDigest body rules: every conclusion ends with the ids it rests on, e.g. (f-1a2b3c, r-4d5e6f); "
+    "distinct conclusions stay distinct, never merge two into one; mark inferred claims as inferred; "
+    "add nothing that no ledger entry or task result supports."
+)
+_WATCHER_DIGEST_TAIL = {True: _WATCHER_DIGEST_RULES, False: _WATCHER_NO_DIGEST}
 
 LEAD_SLOT = "1"
 SINGLE_WORKER_ID = "single"
@@ -429,19 +436,30 @@ def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optiona
     return last_js
 
 
-def _format_ledger_for_watcher(code: str) -> tuple[str, str]:
-    """Watcher view of ledger entries and task results: (entries text, results text), keeping the newest part when over budget."""
+def _format_ledger_for_watcher(code: str, since: str = "") -> tuple[str, str, str]:
+    """Watcher view: (entries newer than `since`, older entries, older task results), keeping the newest part when over budget.
+    With no `since` every entry counts as older."""
     from . import ledger
 
     def _tail(e: dict) -> str:
         return (f" ({'; '.join(e['notes'])})" if e["notes"] else "") + ledger.basis_suffix(e["basis"])
 
-    rows = [f"- {f['id']} [{f['status']}] {ledger.CONFIDENCE_TAG.get(f['confidence'], '')}({f['author']}) "
-            f"{'[flag-method] ' if f['kind'] == 'flag_method' else ''}{f['text']}{_tail(f)}"
-            for f in ledger.facts(code)]
-    res = [f"- {r['id']} [{r['status']}] ({r['author']}) direction '{r['task'][:80]}' -> {r['text'][:400]}{_tail(r)}"
-           for r in ledger.results(code)[-12:]]
-    return ("\n".join(rows) or "(empty)")[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
+    def _row(e: dict) -> str:
+        if e["kind"] == "result":
+            return f"- {e['id']} [{e['status']}] ({e['author']}) direction '{e['task'][:80]}' -> {e['text'][:400]}{_tail(e)}"
+        return (f"- {e['id']} [{e['status']}] {ledger.CONFIDENCE_TAG.get(e['confidence'], '')}({e['author']}) "
+                f"{'[flag-method] ' if e['kind'] == 'flag_method' else ''}{e['text']}{_tail(e)}")
+
+    def _new(e: dict) -> bool:
+        return bool(since) and e["ts"] > since
+
+    facts, results = ledger.facts(code), ledger.results(code)
+    new = sorted((e for e in facts + results if _new(e)), key=lambda e: e["ts"])
+    old_facts = [e for e in facts if not _new(e)]
+    old_results = [e for e in results if not _new(e)][-12:]
+    return (("\n".join(map(_row, new)) or "(none)")[-_WATCHER_BB_CHARS:],
+            ("\n".join(map(_row, old_facts)) or "(empty)")[-_WATCHER_BB_CHARS:],
+            ("\n".join(map(_row, old_results)) or "(empty)")[-_WATCHER_TASKS_CHARS:])
 
 
 class Dispute(NamedTuple):
@@ -559,7 +577,8 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir:
         if llm is None:
             return
         owns_digest = _owns_digest(worker_id)
-        facts_text, results_text = _format_ledger_for_watcher(code)
+        since = ledger.digest_ts(code) if owns_digest else ""
+        new_text, facts_text, results_text = _format_ledger_for_watcher(code, since)
         pending_tasks = list_tasks(code)
         claimed_tasks = list_claimed(code)
         tasks_text = "\n".join(f"- [{t['id']}] {t['text']}" for t in pending_tasks) or "(empty)"
@@ -573,9 +592,9 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir:
             .replace("{digest}", ledger.digest(code) or "(none yet)")
             .replace("{tasks}", tasks_text[-_WATCHER_TASKS_CHARS:])
             .replace("{claimed_tasks}", claimed_text[-_WATCHER_CLAIMED_CHARS:])
+            .replace("{new_since}", f"[New since the last digest ({since})]\n{new_text}\n\n" if since else "")
         )
-        if not owns_digest:
-            prompt += _WATCHER_NO_DIGEST
+        prompt += _WATCHER_DIGEST_TAIL[owns_digest]
         # challenge description + hint (if fetched): lets the watcher use them to maintain the ledger and publish better-fitting exploration directions
         reports_dir = os.path.join(os.getcwd(), "reports")
         context_header = ""

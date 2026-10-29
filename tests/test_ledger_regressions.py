@@ -191,3 +191,50 @@ def test_report_cli_passes_basis_ids_to_the_ledger(repo_copy, monkeypatch):
     assert out.returncode == 0, out.stdout + out.stderr
     [r] = ledger.results(CODE)
     assert (r["text"], r["basis"]) == ("forged admin cookie accepted", [known])
+
+
+@pytest.fixture
+def watcher_prompt(reports, monkeypatch):
+    def _prompt(worker_id: str) -> str:
+        seen: list[str] = []
+
+        class FakeLLM:
+            def invoke(self, messages):
+                seen.append("\n".join(m.content for m in messages))
+                return SimpleNamespace(content="{}")
+
+        monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+        claude_agent._watcher_curate_blackboard(CODE, worker_id, "Thought: read the grid", str(reports))
+        [prompt] = seen
+        return prompt
+    return _prompt
+
+
+def _rows(prompt: str, ids: list[str]) -> list[str]:
+    return [i for ln in prompt.splitlines() for i in ids if ln.startswith(f"- {i} ")]
+
+
+def test_lead_watcher_sees_entries_newer_than_the_digest_first(reports, watcher_prompt, monkeypatch):
+    clock = ["2026-01-01 10:00:00"]
+    monkeypatch.setattr(ledger, "_now", lambda: clock[0])
+    old_fact = ledger.add_fact(CODE, "1", "the grid is read from /static/grid.bin")
+    clock[0] = "2026-01-01 10:00:01"
+    old_result = ledger.add_result(CODE, "solver3", "parse the grid", "rows are 9 bytes")
+    clock[0] = "2026-01-01 10:00:02"
+    ledger.set_digest(CODE, "1", "GOAL: read the grid")
+    clock[0] = "2026-01-01 10:00:03"
+    new_result = ledger.add_result(CODE, "solver4", "seed the PRNG", "seed 0x1234 reproduces row 0")
+    clock[0] = "2026-01-01 10:00:04"
+    new_fact = ledger.add_fact(CODE, "2", "row 1 is the key schedule")
+    ids = [old_fact, old_result, new_result, new_fact]
+
+    owner = watcher_prompt(claude_agent.LEAD_SLOT)
+    head, rest = owner.split("[Ledger entries", 1)
+    assert "New since the last digest (2026-01-01 10:00:02)" in head
+    assert _rows(head, ids) == [new_result, new_fact]
+    assert sorted(_rows(rest, ids)) == sorted([old_fact, old_result])
+    assert "ids it rests on" in owner
+
+    other = watcher_prompt("2")
+    assert "New since the last digest" not in other and "ids it rests on" not in other
+    assert _rows(other, ids) == [old_fact, new_fact, old_result, new_result]
