@@ -1,6 +1,6 @@
-"""Cruiser 运行监控 HTTP 服务。
+"""Cruiser runtime monitoring HTTP service.
 
-调度主进程内后台线程启动；也可独立运行：
+Started as a background thread inside the scheduler main process; can also run standalone:
     uv run python -m cruiser.dashboard
 """
 from __future__ import annotations
@@ -126,7 +126,7 @@ def serve(host: str, port: int) -> ThreadingHTTPServer:
 
 
 def start_dashboard() -> tuple[str, int] | None:
-    """后台启动。环境变量 CRUISER_DASHBOARD=0 关闭。"""
+    """Start in the background. Set the environment variable CRUISER_DASHBOARD=0 to disable."""
     if os.environ.get("CRUISER_DASHBOARD", "1") in ("0", "false", "no"):
         return None
     host = os.environ.get("CRUISER_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -143,7 +143,7 @@ def start_dashboard() -> tuple[str, int] | None:
     t = threading.Thread(target=_run, name="cruiser-dashboard", daemon=True)
     t.start()
     display = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
-    print(f"[Dashboard] 监控面板 http://{display}:{port}", flush=True)
+    print(f"[Dashboard] monitoring dashboard http://{display}:{port}", flush=True)
     return display, port
 
 
@@ -153,14 +153,14 @@ def main() -> None:
     port = _pick_port(host, port)
     httpd = serve(host, port)
     display = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
-    print(f"[Dashboard] 监控面板 http://{display}:{port} （独立模式，读 reports/）", flush=True)
+    print(f"[Dashboard] monitoring dashboard http://{display}:{port} (standalone mode, reading reports/)", flush=True)
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        print("[Dashboard] 已停止", flush=True)
+        print("[Dashboard] stopped", flush=True)
 
 
 if __name__ == "__main__":
-    # 独立进程也要加载 .env（包 init 已做）；保证能找到 reports/
+    # the standalone process also needs .env loaded (done by the package init); make sure reports/ can be found
     os.chdir(_ROOT)
     main()

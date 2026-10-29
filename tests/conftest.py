@@ -11,7 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-# 运行 main.py / tools/*.py 所需的最小项目文件（不含 kb/、reports/ 运行态等）
+# Minimal project files needed to run main.py / tools/*.py (excluding kb/, reports/ runtime state, etc.)
 _COPY_ITEMS = ("main.py", "blackboard_hook.py", "cruiser", "tools", "resource", "frontend")
 
 
@@ -26,7 +26,7 @@ def write_yaml(tmp_path):
 
 @pytest.fixture
 def platform_env(tmp_path, monkeypatch):
-    """隔离的平台单例 + flagstore：所有读写都落在 tmp_path，不碰仓库的 reports/。"""
+    """Isolated platform singleton + flagstore: all reads and writes go to tmp_path, never touching the repo's reports/."""
     import cruiser.challenges as challenges
     import cruiser.tools as tools
 
@@ -46,7 +46,7 @@ def platform_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def repo_copy(tmp_path) -> Path:
-    """把项目复制到临时目录：子进程（main.py / submit_flag.py）写的 reports/ 与仓库隔离。"""
+    """Copy the project to a temp directory so the reports/ written by subprocesses (main.py / submit_flag.py) is isolated from the repo."""
     dst = tmp_path / "repo"
     dst.mkdir()
     for item in _COPY_ITEMS:

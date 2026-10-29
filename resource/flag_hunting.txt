@@ -1,13 +1,13 @@
-# CTF Web 题找 flag 指南（拿到命令执行 / 文件读取后先看这里）
+# Flag-hunting guide for CTF Web challenges (read this first once you have command execution / file read)
 #
-# 适用场景：已经通过 RCE、SSTI、文件包含、文件读取、SQL 注入 into outfile/load_file、
-# 反序列化、模板注入、命令注入等手段拿到「能执行命令」或「能读任意文件」的能力后，
-# 用来快速定位 flag。若还没拿到执行/读取能力，先继续挖漏洞，别急着按本清单硬扫。
+# When to use: after you have gained the ability to "execute commands" or "read arbitrary files" via RCE, SSTI, file inclusion, file read, SQL injection into outfile/load_file,
+# deserialization, template injection, command injection, etc., use this to locate the flag quickly.
+# If you do not have execution/read capability yet, keep hunting for the vulnerability first; do not brute-scan this list prematurely.
 #
-# 核心思路：flag 常见于三类位置 —— (1) 固定文件路径；(2) 环境变量；(3) 容器/挂载元信息。
-# 出题人经常把 flag 放进环境变量或随机文件名，此时死磕 /flag 会漏掉，务必看 /proc 与 env。
+# Core idea: flags are usually in three kinds of places -- (1) fixed file paths; (2) environment variables; (3) container/mount metadata.
+# Challenge authors often put the flag in an environment variable or a random file name; insisting on /flag will miss it, so always check /proc and env.
 
-## 1. 根目录及常见固定路径
+## 1. Root directory and common fixed paths
 /flag
 /flag.txt
 /flag.php
@@ -26,25 +26,25 @@
 /get_flag
 
 
-## 1.5 最优先看的几个地方（很多题的 flag 就藏在这里，且极易被忽略）
-# 这些地方常常直接暴露 flag、flag 文件的真实随机路径、或判分逻辑线索：
-/proc/self/environ          # 当前进程环境变量（flag 常被塞进 env，用 tr '\0' '\n' 查看）
-/proc/1/environ             # 容器 1 号进程（通常是启动进程）的环境变量，flag 高发区
-env                         # 直接执行 env / printenv 打印全部环境变量
-/proc/mounts                # 挂载信息，能看到 flag 被 mount 进容器的真实路径（如 /flag 是单文件挂载）
-/proc/self/mountinfo        # 更详细的挂载信息，含挂载源，常暴露 flag 文件的宿主机/卷路径
-/proc/self/cgroup           # 容器 ID / cgroup 路径，辅助判断运行环境
-/proc/self/cmdline          # 当前进程启动命令行（tr '\0' ' ' 查看），可能含 flag 或路径参数
+## 1.5 Places to check first (many challenges hide the flag here, and they are very easy to overlook)
+# These places often directly expose the flag, the real random path of the flag file, or clues about the scoring logic:
+/proc/self/environ          # environment variables of the current process (flags are often put in env; view with tr '\0' '\n')
+/proc/1/environ             # environment variables of container PID 1 (usually the startup process), a hot spot for flags
+env                         # run env / printenv directly to print all environment variables
+/proc/mounts                # mount info; shows the real path where the flag was mounted into the container (e.g. /flag as a single-file mount)
+/proc/self/mountinfo        # more detailed mount info including the mount source; often exposes the host/volume path of the flag file
+/proc/self/cgroup           # container ID / cgroup path, helps identify the runtime environment
+/proc/self/cmdline          # command line of the current process (view with tr '\0' ' '); may contain the flag or a path argument
 
-# 实用命令示例：
+# Useful command examples:
 #   cat /proc/1/environ | tr '\0' '\n'
 #   cat /proc/self/environ | tr '\0' '\n'
 #   env; printenv
 #   cat /proc/mounts; cat /proc/self/mountinfo
-#   遍历所有进程环境变量找 flag：
+#   search the environment of every process for the flag:
 #     grep -a -r -i flag /proc/*/environ 2>/dev/null | tr '\0' '\n'
 
-## 2. Web 根目录及应用相关
+## 2. Web root and application-related paths
 /var/www/html/flag.php
 /var/www/html/flag.txt
 /var/www/flag
@@ -55,32 +55,32 @@ env                         # 直接执行 env / printenv 打印全部环境变�
 ./flag.txt
 ../flag
 ../../flag
-# 当前工作目录、上级目录也要看；Web 应用配置里有时含 flag 或数据库口令：
+# Also check the current working directory and parent directories; web application config sometimes contains the flag or database passwords:
 /var/www/html/config.php
 /var/www/html/.env
 /app/.env
 
-## 3. 环境变量与进程信息（呼应第 0 节，强调值得逐个进程翻）
-# flag 作为环境变量注入是出题常见套路，务必覆盖：
+## 3. Environment variables and process info (echoes section 0; worth going through process by process)
+# Injecting the flag as an environment variable is a common challenge pattern; always cover:
 #   - env / printenv
-#   - /proc/self/environ、/proc/1/environ
-#   - 若能列进程，逐个读取 /proc/<pid>/environ
-#   - Docker/K8s 场景下也看 /proc/1/cmdline、/proc/1/root/ 下的挂载
+#   - /proc/self/environ, /proc/1/environ
+#   - if you can list processes, read /proc/<pid>/environ for each one
+#   - in Docker/K8s setups also check /proc/1/cmdline and the mounts under /proc/1/root/
 
-## 4. 数据库 / 中间件中的 flag
-# 不少题把 flag 写进数据库表、redis key、或某个配置项：
-#   - MySQL: select * from flag; / show databases; 逐库逐表翻找含 flag 字样的表
-#   - Redis: keys *  然后 get 可疑 key
-#   - 环境变量里的数据库口令 + 上面几处路径组合利用
+## 4. Flags in databases / middleware
+# Many challenges write the flag into a database table, a redis key, or some config entry:
+#   - MySQL: select * from flag; / show databases; go through each database and table looking for tables containing "flag"
+#   - Redis: keys *  then get the suspicious keys
+#   - combine database passwords from environment variables with the paths above
 
-## 5. 隐藏 / 随机文件名的定位技巧
-# flag 文件名随机时，靠固定清单扫不到，改用搜索：
+## 5. Techniques for hidden / randomly named files
+# When the flag file name is random, a fixed list will not find it; search instead:
 #   find / -iname '*flag*' 2>/dev/null
-#   grep -a -r -i 'flag{' / 2>/dev/null            # 直接按 flag 格式全盘搜（注意耗时，先限定目录）
-#   ls -la / /root /home /tmp /var/www 2>/dev/null # 先看目录里有没有异常文件名
-#   结合 /proc/mounts、/proc/self/mountinfo 得到的挂载点优先搜索
+#   grep -a -r -i 'flag{' / 2>/dev/null            # search the whole disk by flag format (slow; narrow the directory first)
+#   ls -la / /root /home /tmp /var/www 2>/dev/null # first look for unusual file names in these directories
+#   search the mount points found via /proc/mounts and /proc/self/mountinfo first
 
-## 6. 备注
-# - 找到疑似 flag 后，必须走题目提供的 submit 脚本让平台确认，不要凭 flag{...} 形态就当作解出。
-# - 全盘 find / grep 较慢，优先按第 0~2 节的高频位置定点读取，扫不到再全盘搜。
-# - flag 格式不一定是 flag{...}，也可能是纯随机串、题目自定义前缀，读到可疑内容都值得提交验证。
+## 6. Notes
+# - Once you find a suspected flag, you must submit it through the challenge's submit script for platform confirmation; do not treat a flag{...} shape alone as solved.
+# - A full-disk find / grep is slow; first read the high-frequency locations in sections 0-2 directly, and only search the whole disk if they turn up nothing.
+# - The flag format is not necessarily flag{...}; it may be a purely random string or a challenge-specific prefix, so any suspicious content is worth submitting to verify.

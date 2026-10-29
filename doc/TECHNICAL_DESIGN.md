@@ -1,839 +1,839 @@
-# Cruiser 技术方案文档
+# Cruiser Technical Design
 
-> 完全本地运行的自动化 CTF Web/逻辑漏洞挖掘与利用 Agent
+> An automated agent for finding and exploiting CTF Web/logic vulnerabilities, running entirely on the local machine
 
-![Cruiser 概念图](assets/cruiser_cover.png)
+![Cruiser concept art](assets/cruiser_cover.png)
 
-| 项目 | 说明 |
-|------|------|
-| 文档版本 | v1.2 |
-| 文档日期 | 2026-10-29 |
-| 适用代码基线 | Cruiser 主分支（`main.py` + `cruiser/` 包） |
-| 读者对象 | 安全研究人员、Agent 系统开发者、自建 CTF 题库的使用者 |
-
----
-
-## 目录
-
-1. [概述](#1-概述)
-2. [总体架构](#2-总体架构)
-3. [核心子系统设计](#3-核心子系统设计)
-4. [分层调度机制](#4-分层调度机制)
-5. [多会话协作机制](#5-多会话协作机制)
-6. [Flag 权威校验与多 Flag 处理](#6-flag-权威校验与多-flag-处理)
-7. [LLM 接入与多模型路由](#7-llm-接入与多模型路由)
-8. [本地题目平台](#8-本地题目平台)
-9. [题目定义格式（YAML）](#9-题目定义格式yaml)
-10. [工具链与离线知识库](#10-工具链与离线知识库)
-11. [配置体系](#11-配置体系)
-12. [并发安全与容错设计](#12-并发安全与容错设计)
-13. [可观测性](#13-可观测性)
-14. [部署与运行](#14-部署与运行)
-15. [性能调优建议](#15-性能调优建议)
-16. [风险与限制](#16-风险与限制)
-17. [演进方向](#17-演进方向)
-18. [附录](#18-附录)
+| Item | Details |
+|------|---------|
+| Document version | v1.2 |
+| Document date | 2026-10-29 |
+| Code baseline | Cruiser main branch (`main.py` + the `cruiser/` package) |
+| Audience | Security researchers, agent-system developers, people running their own CTF challenge sets |
 
 ---
 
-## 1. 概述
+## Contents
 
-### 1.1 背景
-
-CTF（Capture The Flag）题目通常以「一个靶场服务 + 一个或多个 flag」的形式出现。Cruiser 把题目、靶场与答案统一写在本地 YAML 文件（`challenges.yaml`）中：靶场既可以是已在运行的服务，也可以是按需拉起的 docker compose 项目；Agent 直连靶场地址完成漏洞挖掘与利用，拿到 flag 后交给本地平台校验。
-
-人工解题无法匹配批量题目的吞吐要求，因此 Cruiser 的设计目标是：**以完全自动化的方式完成「读取题目 → 启动靶场 → 驱动 Agent 解题 → 校验 flag → 关闭靶场」的完整闭环**，并通过多进程并发、分层调度与跨会话共享记忆机制，在本机并发上限约束下最大化解题吞吐与成功率。整个流程不依赖任何外部比赛平台、凭证或 VPN。
-
-### 1.2 设计目标
-
-| 目标 | 说明 | 对应机制 |
-|------|------|----------|
-| 全自动闭环 | 无需人工干预跑完整个题库 | 主进程调度循环 + 本地题目平台（`cruiser/challenges.py`） |
-| 高吞吐 | 并发名额（默认 3）始终打满 | 分层调度 + 动态并行 |
-| 高成功率 | 难题多轮尝试、多视角探索 | 四级晋升调度 + 多会话黑板共享 + 提示分级启用 |
-| 崩溃可恢复 | 任意一层进程死亡不影响全局 | 三层进程边界 + 进程组回收 + 孤儿清理兜底 |
-| 结果可信 | flag 必须由本地平台按题目定义校验，不信任模型自述 | 框架权威校验 + 程序化补交 |
-| 解题纪律 | 禁联网检索、尽量不依赖提示 | 禁用 WebSearch/WebFetch + 提示延迟到三级启用 |
-
-### 1.3 设计原则
-
-1. **进程边界清晰**：调度、执行、智能体三层进程各司其职，单层崩溃可独立恢复。
-2. **文件系统即总线**：跨进程协作不引入消息队列/数据库，全部通过 `reports/` 目录下的文本文件完成，以 `fcntl` 文件锁 + 临时文件 `os.replace` 原子重写保证并发安全。
-3. **不信任模型自述**：flag 有效性、进度完成度均以本地平台（`reports/_platform_state.json`）的校验结果为唯一事实来源。
-4. **上下文硬注入**：关键协作信息（题目描述/提示/黑板）通过 Claude Code 钩子物理注入模型上下文，不依赖模型自觉读取文件。
-5. **表驱动可扩展**：LLM 提供方接入采用注册表 + 模型名前缀路由，新增一家提供方只需加两行配置。
-
-### 1.4 术语约定
-
-| 术语 | 含义 |
-|------|------|
-| 题目 / Challenge | 题目定义文件中的一道 CTF 题，有唯一 `code`，可能包含多个 flag |
-| 会话 / Session | 一次完整的 `claude` CLI 解题对话 |
-| Worker | 执行层子进程（`main.py --sessions 1` 副本），每个 worker 拉起一个 claude 会话 |
-| Solver | 定向 worker：只认领任务板上的一条探索方向并聚焦执行 |
-| Watcher | 后台策展 LLM：审阅会话活动，维护黑板质量、发布探索方向 |
-| 黑板 / Blackboard | 跨会话共享的关键事实文件 `reports/info_<code>.txt` |
-| 任务板 / Task Board | 待认领探索方向文件 `reports/tasks_<code>.txt` |
-| `[COUNT]` | worker 打印的步数计数（每个 assistant 事件 +1），调度器据此判定层级阈值 |
-| turn | claude CLI 的回合数（`--max-turns`），与 `[COUNT]` 不同口径，约为数倍关系 |
+1. [Overview](#1-overview)
+2. [Overall architecture](#2-overall-architecture)
+3. [Core subsystem design](#3-core-subsystem-design)
+4. [Tiered scheduling](#4-tiered-scheduling)
+5. [Multi-session collaboration](#5-multi-session-collaboration)
+6. [Authoritative flag verification and multi-flag handling](#6-authoritative-flag-verification-and-multi-flag-handling)
+7. [LLM access and multi-model routing](#7-llm-access-and-multi-model-routing)
+8. [Local challenge platform](#8-local-challenge-platform)
+9. [Challenge definition format (YAML)](#9-challenge-definition-format-yaml)
+10. [Toolchain and offline knowledge base](#10-toolchain-and-offline-knowledge-base)
+11. [Configuration](#11-configuration)
+12. [Concurrency safety and fault tolerance](#12-concurrency-safety-and-fault-tolerance)
+13. [Observability](#13-observability)
+14. [Deployment and operation](#14-deployment-and-operation)
+15. [Performance tuning](#15-performance-tuning)
+16. [Risks and limitations](#16-risks-and-limitations)
+17. [Future directions](#17-future-directions)
+18. [Appendix](#18-appendix)
 
 ---
 
-## 2. 总体架构
+## 1. Overview
 
-### 2.1 三层进程架构
+### 1.1 Background
 
-Cruiser 的解题引擎基于 [`claude` CLI](https://docs.anthropic.com/en/docs/claude-code)（`--output-format stream-json` 流式模式）驱动一个自主 Agent，Anthropic 兼容端点默认接入 DeepSeek。系统分为三层进程：
+A CTF (Capture The Flag) challenge usually takes the form of "one target service + one or more flags". Cruiser keeps challenges, targets, and answers together in a local YAML file (`challenges.yaml`): a target can be an already-running service or a docker compose project started on demand. The agent connects directly to the target address to find and exploit vulnerabilities, and hands any flag it gets to the local platform for verification.
+
+Solving by hand cannot keep up with the throughput a batch of challenges needs, so Cruiser's design goal is: **complete the full loop of "read challenge → start target → drive the agent to solve → verify the flag → shut down the target" fully automatically**, and maximize solving throughput and success rate within the local concurrency limit through multi-process concurrency, tiered scheduling, and memory shared across sessions. The whole flow depends on no external competition platform, credentials, or VPN.
+
+### 1.2 Design goals
+
+| Goal | Description | Mechanism |
+|------|-------------|-----------|
+| Fully automatic loop | Runs through the whole challenge set without human intervention | Main-process scheduling loop + local challenge platform (`cruiser/challenges.py`) |
+| High throughput | Concurrency slots (default 3) are always full | Tiered scheduling + dynamic parallelism |
+| High success rate | Hard challenges get multiple rounds and multiple viewpoints | Four-tier promotion + blackboard shared across sessions + hints enabled by tier |
+| Crash recovery | Death of a process at any layer does not affect the whole system | Three-layer process boundaries + process-group reaping + orphan cleanup fallback |
+| Trustworthy results | Flags must be verified by the local platform against the challenge definition; the model's own claims are not trusted | Authoritative framework verification + programmatic resubmission |
+| Solving discipline | No web search, minimal reliance on hints | WebSearch/WebFetch disabled + hints delayed until tier 3 |
+
+### 1.3 Design principles
+
+1. **Clear process boundaries**: the scheduler, execution, and agent layers each have their own job, and a crash in one layer can be recovered independently.
+2. **The file system is the bus**: cross-process collaboration introduces no message queue or database; everything goes through text files under `reports/`, made concurrency-safe with `fcntl` file locks plus atomic rewrites via a temp file and `os.replace`.
+3. **Do not trust the model's own claims**: flag validity and progress are judged solely by the local platform's verification results (`reports/_platform_state.json`).
+4. **Hard context injection**: key collaboration information (challenge description/hint/blackboard) is injected directly into the model context through Claude Code hooks, without relying on the model choosing to read files.
+5. **Table-driven extensibility**: LLM providers are wired in through a registry + model-name prefix routing; adding a provider takes only two lines of configuration.
+
+### 1.4 Terminology
+
+| Term | Meaning |
+|------|---------|
+| Challenge | One CTF challenge in the challenge definition file, with a unique `code`; it may contain several flags |
+| Session | One complete `claude` CLI solving conversation |
+| Worker | An execution-layer subprocess (a copy of `main.py --sessions 1`); each worker launches one claude session |
+| Solver | A directed worker: it claims a single exploration direction from the task board and focuses on executing it |
+| Watcher | Background curation LLM: reviews session activity, maintains blackboard quality, publishes exploration directions |
+| Blackboard | The file of key facts shared across sessions, `reports/info_<code>.txt` |
+| Task board | The file of exploration directions waiting to be claimed, `reports/tasks_<code>.txt` |
+| `[COUNT]` | The step count printed by a worker (+1 per assistant event); the scheduler uses it to judge tier thresholds |
+| turn | The claude CLI turn count (`--max-turns`); measured differently from `[COUNT]`, which is roughly several times larger |
+
+---
+
+## 2. Overall architecture
+
+### 2.1 Three-layer process architecture
+
+Cruiser's solving engine drives an autonomous agent through the [`claude` CLI](https://docs.anthropic.com/en/docs/claude-code) (in `--output-format stream-json` streaming mode); the Anthropic-compatible endpoint defaults to DeepSeek. The system has three process layers:
 
 ```mermaid
 flowchart TB
-    subgraph L1["调度层（main.py 主进程）"]
-        SCH["分层调度循环<br/>拉题 / 晋级 / 限流"]
-        CTRM["靶场治理<br/>启动 / 预热 / 关闭"]
-        REAP["进程治理<br/>atexit killpg / 孤儿清理"]
-        DASH["运行台 dashboard.py<br/>:8765"]
+    subgraph L1["Scheduler layer (main.py main process)"]
+        SCH["Tiered scheduling loop<br/>fetch / promote / rate-limit"]
+        CTRM["Target management<br/>start / warm up / shut down"]
+        REAP["Process management<br/>atexit killpg / orphan cleanup"]
+        DASH["Dashboard dashboard.py<br/>:8765"]
     end
 
-    subgraph L2["执行层（worker 子进程 × N）"]
+    subgraph L2["Execution layer (worker subprocesses × N)"]
         W1["worker #1<br/>run_auto_scan()"]
         W2["worker #2<br/>run_auto_scan()"]
         W3["worker #3<br/>run_auto_scan()"]
     end
 
-    subgraph L3["Agent 层（claude CLI 进程 × N）"]
-        C1["claude 会话 #1<br/>Bash/Read/Write 工具"]
-        C2["claude 会话 #2"]
-        C3["claude 会话 #3"]
+    subgraph L3["Agent layer (claude CLI processes × N)"]
+        C1["claude session #1<br/>Bash/Read/Write tools"]
+        C2["claude session #2"]
+        C3["claude session #3"]
     end
 
-    subgraph EXT["外部依赖"]
-        PLAT[("本地题目平台 challenges.py<br/>challenges.yaml + _platform_state.json")]
-        LLM[("LLM 端点<br/>DeepSeek / Kimi / GLM")]
-        RANGE[("靶场<br/>已运行服务 / docker compose")]
+    subgraph EXT["External dependencies"]
+        PLAT[("Local challenge platform challenges.py<br/>challenges.yaml + _platform_state.json")]
+        LLM[("LLM endpoints<br/>DeepSeek / Kimi / GLM")]
+        RANGE[("Targets<br/>running service / docker compose")]
     end
 
-    subgraph FS["文件系统总线（reports/）"]
-        BB["info_&lt;code&gt;.txt<br/>共享黑板"]
-        TB["tasks_&lt;code&gt;.txt<br/>任务板"]
+    subgraph FS["File system bus (reports/)"]
+        BB["info_&lt;code&gt;.txt<br/>shared blackboard"]
+        TB["tasks_&lt;code&gt;.txt<br/>task board"]
         HINT["hint_&lt;code&gt;.txt / desc_&lt;code&gt;.txt"]
-        RT["_runtime.json 运行态快照"]
+        RT["_runtime.json runtime snapshot"]
     end
 
-    SCH -->|spawn 子进程| W1 & W2 & W3
+    SCH -->|spawn subprocesses| W1 & W2 & W3
     SCH --> DASH
     DASH --> BB & TB & HINT & RT
-    SCH -->|写入快照| RT
+    SCH -->|write snapshot| RT
     W1 --> C1
     W2 --> C2
     W3 --> C3
     SCH <-->|list/start/hint/close| PLAT
-    W1 -.->|submit 权威校验 flag| PLAT
+    W1 -.->|submit: authoritative flag check| PLAT
     PLAT -->|compose up/down| RANGE
-    C1 & C2 & C3 <-->|Anthropic 兼容端点| LLM
-    C1 & C2 & C3 -->|渗透/利用| RANGE
-    C1 & C2 & C3 <-->|读写（文件锁+原子重写）| BB & TB
-    SCH -->|写入| HINT
+    C1 & C2 & C3 <-->|Anthropic-compatible endpoint| LLM
+    C1 & C2 & C3 -->|pentest/exploit| RANGE
+    C1 & C2 & C3 <-->|read/write, file lock + atomic rewrite| BB & TB
+    SCH -->|write| HINT
 ```
 
-进程链：
+Process chain:
 
 ```
-main.py（调度器）→ main.py --sessions 1（worker）→ claude CLI → bash/python 工具子进程
+main.py (scheduler) → main.py --sessions 1 (worker) → claude CLI → bash/python tool subprocesses
 ```
 
-各层职责与崩溃隔离：
+Responsibilities and crash isolation per layer:
 
-| 层 | 进程 | 职责 | 崩溃影响面 |
-|----|------|------|------------|
-| 调度层 | `main.py` 主进程 | 唯一管理靶场生命周期的进程：轮询未解题目、分层调度、spawn worker、监控 `[COUNT]` 步数、关闭靶场与回收孤儿进程、拉起运行台 | 全局退出，`atexit` 整组清理 worker 并 down 掉 `cruiser_*` compose 项目 |
-| 执行层 | worker 子进程（带 `CRUISER_WORKER_ID`） | 调用 `run_auto_scan()`，拉起并解析 claude 流式输出，触发 watcher，权威校验 flag | 单题单会话失败，不影响其他题目 |
-| Agent 层 | `claude` CLI 进程 | 真正的解题智能体，用内置 Bash/Read/Write 工具侦察与利用 | 会话结束，worker 收尾后可重启新会话 |
+| Layer | Process | Responsibility | Crash blast radius |
+|-------|---------|----------------|--------------------|
+| Scheduler layer | `main.py` main process | The only process that manages target lifecycles: polls unsolved challenges, schedules by tier, spawns workers, monitors `[COUNT]` step counts, shuts down targets and reaps orphan processes, serves the dashboard | Global exit; `atexit` cleans up all workers as a group and brings down the `cruiser_*` compose projects |
+| Execution layer | Worker subprocess (with `CRUISER_WORKER_ID`) | Calls `run_auto_scan()`, launches claude and parses its streaming output, triggers the watcher, verifies flags authoritatively | One session of one challenge fails; other challenges are unaffected |
+| Agent layer | `claude` CLI process | The actual solving agent, using built-in Bash/Read/Write tools for reconnaissance and exploitation | The session ends; after the worker wraps up, a new session can be started |
 
-### 2.2 端到端数据流
+### 2.2 End-to-end data flow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant M as 主进程(调度器)
-    participant P as 本地平台
-    participant W as Worker 进程
+    participant M as Main process (scheduler)
+    participant P as Local platform
+    participant W as Worker process
     participant C as claude CLI
-    participant R as 靶场
-    participant F as reports/ 文件总线
+    participant R as Target
+    participant F as reports/ file bus
 
-    loop 调度主循环（1s 周期）
-        M->>P: list_challenges() 读取题目定义 + 进度
-        P-->>M: 未解题目 + flag 进度 X/Y
-        M->>P: start(code)（名额允许时；compose 题目 up -d）
-        P-->>M: 目标 URL 列表
-        M->>M: 端口就绪探测（≤60s）+ 写 desc_<code>.txt
-        M->>W: spawn（注入目标/题目码/模型/温度等环境变量）
-        W->>F: 注册 .claude/settings.json 钩子
-        W->>C: claude -p <任务提示> --output-format stream-json
-        C->>F: SessionStart 钩子注入 描述+提示+黑板
-        loop 解题循环
-            C->>R: 侦察 / 漏洞验证 / 利用（Bash 工具）
-            R-->>C: 响应（含 flag 线索）
-            C->>F: PostToolUse 每 10 步注入最新黑板
-            W->>W: 默认每 4 步后台触发 watcher 策展
-            C->>P: submit_flag.py 提交候选 flag
-            P-->>C: 正确 / 重复 / 错误 + 进度 X/Y
+    loop Main scheduling loop (1s period)
+        M->>P: list_challenges() reads definitions + progress
+        P-->>M: Unsolved challenges + flag progress X/Y
+        M->>P: start(code) (when a slot is free, compose challenges run up -d)
+        P-->>M: List of target URLs
+        M->>M: Port readiness probe (≤60s) + write desc_<code>.txt
+        M->>W: spawn (inject target/challenge code/model/temperature env vars)
+        W->>F: Register .claude/settings.json hooks
+        W->>C: claude -p <task prompt> --output-format stream-json
+        C->>F: SessionStart hook injects description+hint+blackboard
+        loop Solving loop
+            C->>R: Recon / vulnerability check / exploitation (Bash tool)
+            R-->>C: Responses (with flag clues)
+            C->>F: PostToolUse injects latest blackboard every 10 steps
+            W->>W: Watcher curation in the background, every 4 steps by default
+            C->>P: submit_flag.py submits a candidate flag
+            P-->>C: Correct / duplicate / wrong + progress X/Y
         end
-        C-->>W: stream-json 结束（result 事件）
-        W->>P: 收尾：对所有 flag 候选程序化补交校验
-        W-->>M: 输出 {"flag": ...} 或 达到步数阈值
-        M->>P: close(code)（compose 题目 down -v）
+        C-->>W: stream-json ends (result event)
+        W->>P: Wrap-up: programmatically resubmit all flag candidates
+        W-->>M: Prints {"flag": ...} or reaches the step threshold
+        M->>P: close(code) (compose challenges run down -v)
     end
 ```
 
-### 2.3 关键技术选型
+### 2.3 Key technology choices
 
-| 维度 | 选型 | 理由 |
-|------|------|------|
-| Agent 运行时 | `claude` CLI（stream-json headless 模式） | 成熟的工具调用循环、上下文压缩、钩子机制；避免自研 ReAct 循环的可靠性问题（旧 `cruiser/agent.py` 手写 ReAct 引擎已弃用保留参考） |
-| 解题模型 | DeepSeek（默认 `deepseek-v4-flash`） | 经 Anthropic 兼容端点接入，1M 上下文窗口 |
-| 策展模型 | `deepseek-v4-pro` | 黑板策展与方向规划需要更强推理能力 |
-| 进程间通信 | 文件系统 + `fcntl` 锁 + `os.replace` | 零外部依赖、崩溃一致性好、可人工检视 |
-| 题目平台 | 本地 YAML + `fcntl` 状态文件（`cruiser/challenges.py`） | 无外部依赖；题目/靶场/答案可版本化管理；与黑板同一套文件总线并发模型 |
-| 包管理 | uv + `pyproject.toml` | 快速、可锁定（`uv.lock`）；离线镜像整份分发虚拟环境 |
+| Area | Choice | Rationale |
+|------|--------|-----------|
+| Agent runtime | `claude` CLI (stream-json headless mode) | Mature tool-call loop, context compaction, and hook mechanism; avoids the reliability problems of a home-grown ReAct loop (the old hand-written ReAct engine `cruiser/agent.py` is deprecated and kept for reference) |
+| Solving model | DeepSeek (default `deepseek-v4-flash`) | Wired in through the Anthropic-compatible endpoint, 1M context window |
+| Curation model | `deepseek-v4-pro` | Blackboard curation and direction planning need stronger reasoning |
+| Inter-process communication | File system + `fcntl` locks + `os.replace` | No external dependencies, good crash consistency, human-inspectable |
+| Challenge platform | Local YAML + `fcntl` state file (`cruiser/challenges.py`) | No external dependencies; challenges/targets/answers can be version-controlled; same file-bus concurrency model as the blackboard |
+| Package management | uv + `pyproject.toml` | Fast and lockable (`uv.lock`); offline images ship the whole virtual environment |
 
 ---
 
-## 3. 核心子系统设计
+## 3. Core subsystem design
 
-### 3.1 项目结构
+### 3.1 Project layout
 
 ```
 Cruiser/
-├── main.py                  # CLI 入口：题目调度、多会话并发、分层调度、靶场/进程治理、运行台
-├── challenges.example.yaml  # 题目定义示例（复制为 challenges.yaml 使用）
-├── examples/web-demo/       # 演示靶场（Flask + docker compose）
-├── blackboard_hook.py       # Claude Code 钩子：描述/提示/黑板硬注入模型上下文
-├── kill_orphans.py          # 悬空 worker/claude 进程清理兜底
-├── frontend/                # 运行台静态资源（console.js / console.css / index.html）
-├── tools/                   # Agent 调用的 CLI 封装脚本
-│   ├── submit_flag.py       # 命令行提交 flag（经本地平台校验）
-│   ├── dirsearch_scan.py    # 跨会话去重的目录扫描（同一 URL 只实扫一次）
-│   ├── task_board.py        # 探索方向任务板命令行（list/claim/report）
-│   └── decompile.py         # PyGhidra 无头反编译 CLI
-├── pyproject.toml           # 项目配置与依赖声明
+├── main.py                  # CLI entry: challenge scheduling, multi-session concurrency, tiered scheduling, target/process management, dashboard
+├── challenges.example.yaml  # Example challenge definitions (copy to challenges.yaml to use)
+├── examples/web-demo/       # Demo target (Flask + docker compose)
+├── blackboard_hook.py       # Claude Code hook: hard-injects description/hint/blackboard into the model context
+├── kill_orphans.py          # Fallback cleanup for dangling worker/claude processes
+├── frontend/                # Dashboard static assets (console.js / console.css / index.html)
+├── tools/                   # CLI wrapper scripts called by the agent
+│   ├── submit_flag.py       # Submit a flag from the command line (verified by the local platform)
+│   ├── dirsearch_scan.py    # Directory scan deduplicated across sessions (each URL is scanned once)
+│   ├── task_board.py        # Exploration task board CLI (list/claim/report)
+│   └── decompile.py         # PyGhidra headless decompiler CLI
+├── pyproject.toml           # Project configuration and dependencies
 ├── cruiser/
-│   ├── __init__.py          # 包初始化：禁用 LangSmith 追踪、加载 .env
-│   ├── challenges.py        # 本地题目平台：YAML 解析校验、靶场启停、flag 校验与进度
-│   ├── claude_agent.py      # 当前解题引擎：claude CLI 驱动 + 黑板 watcher
-│   ├── dashboard.py         # 运行台 HTTP：快照 / 黑板 / 任务板 / 日志
-│   ├── runtime.py           # 调度器运行态快照（供运行台读取）
-│   ├── taskboard.py         # 任务板读写（文件锁 + 原子重写）
-│   ├── llm.py               # LLM 提供方注册表与路由（DeepSeek / Kimi / GLM）
-│   ├── prompt.py            # 系统提示词与任务模板
-│   ├── tools.py             # submit_flag、dirsearch/xss 等工具
-│   └── agent.py             # 旧版手写 ReAct 引擎（已弃用，保留供参考）
-├── resource/                # 用户名/密码/XSS payload/flag 线索字典
-├── kb/                      # 离线漏洞知识库（git submodule：vulhub / nuclei-templates / PayloadsAllTheThings；nuclei 二进制需自行下载）
-├── tests/                   # pytest：本地平台、flag 提交、调度器冒烟
-├── doc/                     # 本文档
-└── reports/                 # 运行时共享黑板 / 任务板 / 提示 / 描述 / 解题进度 / 运行态快照（空目录入库）
+│   ├── __init__.py          # Package init: disables LangSmith tracing, loads .env
+│   ├── challenges.py        # Local challenge platform: YAML parsing/validation, target start/stop, flag verification and progress
+│   ├── claude_agent.py      # Current solving engine: claude CLI driver + blackboard watcher
+│   ├── dashboard.py         # Dashboard HTTP: snapshot / blackboard / task board / logs
+│   ├── runtime.py           # Scheduler runtime snapshot (read by the dashboard)
+│   ├── taskboard.py         # Task board read/write (file lock + atomic rewrite)
+│   ├── llm.py               # LLM provider registry and routing (DeepSeek / Kimi / GLM)
+│   ├── prompt.py            # System prompts and task templates
+│   ├── tools.py             # submit_flag, dirsearch/xss and other tools
+│   └── agent.py             # Legacy hand-written ReAct engine (deprecated, kept for reference)
+├── resource/                # Username/password/XSS payload/flag clue wordlists
+├── kb/                      # Offline vulnerability knowledge base (git submodules: vulhub / nuclei-templates / PayloadsAllTheThings; download the nuclei binary yourself)
+├── tests/                   # pytest: local platform, flag submission, scheduler smoke test
+├── doc/                     # This document
+└── reports/                 # Runtime shared blackboard / task board / hints / descriptions / solving progress / runtime snapshot (empty dir is tracked)
 ```
 
-### 3.2 调度层（`main.py` 主进程）
+### 3.2 Scheduler layer (`main.py` main process)
 
-主进程是系统中**唯一管理靶场生命周期**的进程（worker 仅以 `submit_flag.py` 形式向本地平台做权威校验提交），职责包括：
+The main process is the **only process that manages target lifecycles** (workers only submit to the local platform for authoritative verification through `submit_flag.py`). Its responsibilities:
 
-1. **启动自检**
-   - 加载并校验题目定义（`CRUISER_CHALLENGES`，默认 `challenges.yaml`），失败即报错退出；把定义文件的绝对路径写回环境变量，保证 worker 与 Agent 在工作空间内调用的 `submit_flag.py` 读到同一份定义；
-   - `down_leftovers()`：对上次异常退出遗留的 `cruiser_*` docker compose 项目执行 `down -v`，确保从干净状态开始（未安装 Docker/compose 时静默跳过）。
+1. **Startup self-check**
+   - Loads and validates the challenge definitions (`CRUISER_CHALLENGES`, default `challenges.yaml`) and exits with an error on failure; writes the definition file's absolute path back into the environment so that workers and the `submit_flag.py` the agent calls inside its workspace read the same definitions;
+   - `down_leftovers()`: runs `down -v` on any `cruiser_*` docker compose projects left behind by an abnormal exit last time, so the run starts from a clean state (skipped silently when Docker/compose is not installed).
 
-2. **调度主循环**（1 秒周期）
-   - `fetch_all_unsolved()` 从本地平台读取未解题目及进度；
-   - 与内存中的层级队列（`preprocessed / tier1 / tier2 / tier3 / solved`）对账：题目解出（或从定义文件中删除）后不再出现在未解列表，触发对应会话组的强杀（`kill_flags[code].set()`）；
-   - 按层级依次尝试启动各题的执行器线程，受 `MAX_INFLIGHT`（`CRUISER_MAX_ACTIVE`，默认 3）严格限流；
-   - 全部题目解出且无在飞会话组时，调度器正常退出。
+2. **Main scheduling loop** (1-second period)
+   - `fetch_all_unsolved()` reads unsolved challenges and progress from the local platform;
+   - Reconciles against the in-memory tier queues (`preprocessed / tier1 / tier2 / tier3 / solved`): a challenge that is solved (or removed from the definition file) no longer appears in the unsolved list, which triggers a forced kill of its session group (`kill_flags[code].set()`);
+   - Tries to start each challenge's executor thread tier by tier, strictly rate-limited by `MAX_INFLIGHT` (`CRUISER_MAX_ACTIVE`, default 3);
+   - When every challenge is solved and no session group is in flight, the scheduler exits normally.
 
-3. **worker 生命周期管理**
-   - `spawn_worker()`：以 `main.py --sessions 1 --challenge-code <CODE>` 形式 fork 子进程，注入 `CRUISER_WORKER_ID`（兼作「跳过启动自检」的身份标记）、`CRUISER_WORKSPACE_DIR`、目标地址、模型（`ANTHROPIC_MODEL`）等环境变量；worker 以 `start_new_session` 启动为**独立进程组**。
-   - `reader_thread()`：逐行读取 worker 输出，解析 `[COUNT]`，把日志推入运行态；整题是否解出以本地平台的 flag 进度（每 2s 对账一次）为准。
-   - 退出清理：`atexit` + SIGINT/SIGTERM 处理器对所有 worker 进程组 `killpg`，并 down 掉所有 `cruiser_*` compose 项目；`kill_orphans.py` 作为父进程意外死亡后的悬空进程兜底清理。
+3. **Worker lifecycle management**
+   - `spawn_worker()`: forks a subprocess as `main.py --sessions 1 --challenge-code <CODE>`, injecting environment variables such as `CRUISER_WORKER_ID` (which doubles as the "skip startup self-check" marker), `CRUISER_WORKSPACE_DIR`, the target address, and the model (`ANTHROPIC_MODEL`); the worker is started with `start_new_session` as an **independent process group**.
+   - `reader_thread()`: reads worker output line by line, parses `[COUNT]`, and pushes logs into the runtime state; whether the whole challenge is solved is decided by the local platform's flag progress (reconciled every 2s).
+   - Exit cleanup: `atexit` + SIGINT/SIGTERM handlers `killpg` every worker process group and bring down all `cruiser_*` compose projects; `kill_orphans.py` is the fallback cleanup for dangling processes after the parent dies unexpectedly.
 
-4. **跳过语义**
-   - skipped（靶场启动失败、本轮未实际执行）与 remaining（实际执行但未解出）严格区分——skipped 不消耗层级进度，留在原层重试。
+4. **Skip semantics**
+   - skipped (the target failed to start, so nothing actually ran this round) is strictly distinguished from remaining (it ran but was not solved): skipped does not consume tier progress and stays in its current tier to retry.
 
-### 3.3 执行层（worker 子进程）
+### 3.3 Execution layer (worker subprocesses)
 
-worker 是 `main.py` 自身的副本，因带 `CRUISER_WORKER_ID` 而跳过启动自检，直接调用 `cruiser.claude_agent.run_auto_scan()`：
+A worker is a copy of `main.py` itself; because it carries `CRUISER_WORKER_ID`, it skips the startup self-check and calls `cruiser.claude_agent.run_auto_scan()` directly:
 
-1. 按是否带 `solver_task` 选择系统提示词与任务模板（普通探索 / solver 定向模式）；
-2. 在工作空间写入 `.claude/settings.json` 注册黑板钩子（见 §5.2）；
-3. 拉起 `claude` CLI 子进程（**不**使用 `start_new_session`，使其留在本进程组内，调度器 `killpg` 时可整组回收）；
-4. 逐行解析 stream-json 事件流：
-   - `assistant` 事件：`[COUNT]` 步数 +1、提取文本与工具调用、滚动维护最近活动摘要（默认 `deque(maxlen=48)`，`CRUISER_WATCHER_RECENT`）、默认每 4 步（`CRUISER_WATCHER_EVERY`）触发一次后台 watcher、捕获模型提交的 flag 并**当场权威校验**；
-   - `user` 事件（工具结果）：正则收集 `flag{...}` 候选，追加观察摘要；
-   - `result` 事件：会话结束（success / error_max_turns / error_*），跳出循环；
-5. 收尾：会话结束时同步触发一次最终 watcher（30s 超时保护），并对全部 flag 候选逐个程序化补交校验（命中即输出 `[FLAG RECOVERED]`）。
+1. Picks the system prompt and task template depending on whether a `solver_task` is given (regular exploration / directed solver mode);
+2. Writes `.claude/settings.json` into the workspace to register the blackboard hooks (see §5.2);
+3. Launches the `claude` CLI subprocess (**without** `start_new_session`, so it stays in this process group and is reaped together when the scheduler calls `killpg`);
+4. Parses the stream-json event stream line by line:
+   - `assistant` events: `[COUNT]` step +1, extract text and tool calls, maintain a rolling recent-activity summary (default `deque(maxlen=48)`, `CRUISER_WATCHER_RECENT`), trigger a background watcher every 4 steps by default (`CRUISER_WATCHER_EVERY`), capture flags the model submits and **verify them authoritatively on the spot**;
+   - `user` events (tool results): collect `flag{...}` candidates by regex and append observation summaries;
+   - `result` event: the session ended (success / error_max_turns / error_*); break out of the loop;
+5. Wrap-up: when the session ends, run one final watcher synchronously (30s timeout guard) and programmatically resubmit every flag candidate one by one (a hit prints `[FLAG RECOVERED]`).
 
-### 3.4 Agent 层（`claude` CLI 进程）
+### 3.4 Agent layer (`claude` CLI process)
 
-Agent 层的启动命令形态：
+Shape of the agent-layer launch command:
 
 ```bash
-claude -p "<任务提示>" \
+claude -p "<task prompt>" \
   --output-format stream-json --verbose \
   --permission-mode bypassPermissions \
-  --append-system-prompt "<系统提示>" \
+  --append-system-prompt "<system prompt>" \
   --disallowedTools "WebSearch,WebFetch" \
   [--max-turns N]
 ```
 
-设计要点：
+Design points:
 
-- **禁联网检索**：遵循常见 CTF 规则禁止联网检索，显式从工具集移除 `WebSearch`/`WebFetch`（headless 下 `bypassPermissions` 会自动放行，必须显式禁用）。
-- **系统提示词**（`cruiser/prompt.py`）：定位「Web 漏洞 + 逻辑漏洞」解题专家，覆盖 SQL 注入、XSS（目标为弹窗 `XSS` 字符串）、CSRF、文件包含、文件上传、越权、竞态、业务逻辑等类别的识别与利用套路，并内置工程化守则：
-  - 批量/并发策略：爆破枚举类任务必须写脚本或用 `seq | xargs -P N` 并发，禁止逐请求手工尝试；
-  - 工具纪律：调用安全工具先 `-h/--help`；目录扫描必须走 `dirsearch_scan` 工具（跨会话去重 + 报告落盘，避免上下文溢出）；flag 只能经 `submit_flag` 工具提交；
-  - 产物落盘：大输出写入 `$CRUISER_WORKSPACE_DIR` 后再读取筛选，避免撑爆上下文。
-- **上下文窗口管理**：通过 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`（默认 1,000,000）声明真实窗口，`CLAUDE_CODE_AUTO_COMPACT_WINDOW`（默认 800,000）提前触发 auto-compact，留余量避免逼近硬上限。
+- **No web search**: following common CTF rules against searching online, `WebSearch`/`WebFetch` are explicitly removed from the tool set (in headless mode `bypassPermissions` would allow them automatically, so they must be disabled explicitly).
+- **System prompt** (`cruiser/prompt.py`): positions the agent as a "Web vulnerability + logic vulnerability" solving expert, covering how to recognize and exploit SQL injection, XSS (the goal is an alert popup with the string `XSS`), CSRF, file inclusion, file upload, broken access control, race conditions, business logic, and other categories, with built-in engineering rules:
+  - Batch/concurrency strategy: brute-force and enumeration tasks must be scripted or run concurrently with `seq | xargs -P N`; trying requests one at a time by hand is forbidden;
+  - Tool discipline: run `-h/--help` before calling a security tool; directory scans must go through the `dirsearch_scan` tool (deduplicated across sessions + report saved to disk, to avoid context overflow); flags may only be submitted through the `submit_flag` tool;
+  - Saving artifacts to disk: large output is written to `$CRUISER_WORKSPACE_DIR` and then read and filtered, to avoid blowing up the context.
+- **Context window management**: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 1,000,000) declares the real window, and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (default 800,000) triggers auto-compact early, leaving headroom before the hard limit.
 
 ---
 
-## 4. 分层调度机制
+## 4. Tiered scheduling
 
-### 4.1 层级模型
+### 4.1 Tier model
 
-新题在四个队列间逐级晋升，每级步数阈值递增；任一会话解出 flag 即整组停止。提示（hint）属于额外信息（许多赛事查看提示会扣分），因此**延迟到三级才启用**——先用纯黑盒能力尝试，必要时再借助提示。
+A new challenge is promoted through four queues, with a growing step threshold at each tier; as soon as any session finds the flag, the whole group stops. A hint is extra information (many competitions deduct points for viewing hints), so it is **delayed until tier 3**: pure black-box ability is tried first, and the hint is used only when needed.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> 预处理 : 新题出现
-    预处理 --> 已解决 : 出 flag
-    预处理 --> 一级 : 50 步未解出
-    一级 --> 已解决 : 出 flag
-    一级 --> 二级 : 100 步未解出
-    二级 --> 已解决 : 出 flag
-    二级 --> 三级 : 150 步未解出
-    三级 --> 已解决 : 出 flag
-    三级 --> 三级 : 200 步未解出<br/>放回队尾循环重试（带提示）
-    已解决 --> [*]
+    [*] --> Preprocess : new challenge appears
+    Preprocess --> Solved : flag found
+    Preprocess --> Tier1 : unsolved after 50 steps
+    Tier1 --> Solved : flag found
+    Tier1 --> Tier2 : unsolved after 100 steps
+    Tier2 --> Solved : flag found
+    Tier2 --> Tier3 : unsolved after 150 steps
+    Tier3 --> Solved : flag found
+    Tier3 --> Tier3 : unsolved after 200 steps<br/>back to end of queue, retry (with hint)
+    Solved --> [*]
 ```
 
-| 层级 | 触发条件 | 步数阈值 | 是否带提示 | 未解出去向 |
-|------|----------|----------|------------|------------|
-| 预处理 | 新题 | 50 | 否 | 晋级一级 |
-| 一级 | 预处理未解出 | 100 | 否 | 晋级二级 |
-| 二级 | 一级未解出 | 150 | 否 | 晋级三级 |
-| 三级 | 二级未解出 | 200 | 是 | 放回队尾，按 200 步循环重试 |
+| Tier | Trigger | Step threshold | Hint given | If unsolved |
+|------|---------|----------------|------------|-------------|
+| Pre-processing | New challenge | 50 | No | Promoted to tier 1 |
+| Tier 1 | Not solved in pre-processing | 100 | No | Promoted to tier 2 |
+| Tier 2 | Not solved in tier 1 | 150 | No | Promoted to tier 3 |
+| Tier 3 | Not solved in tier 2 | 200 | Yes | Back to the end of the queue, retried in 200-step rounds |
 
-补充规则：
+Additional rules:
 
-- 一级队列按题目难度排序（`DIFF_RANK`），优先打简单题，快速积累得分；
-- **skipped 语义**：靶场启动失败导致本轮根本没执行的题，不算尝试过、不晋级，留在原层等待下一轮；
-- 每一级对同一道题并发拉起 `--sessions` 个**黑盒** worker 会话（全程黑盒，无源码审计），各会话独立探索、以不同会话编号署名；
-- 所有 worker 均为主力波（wave=2），全部计入步数阈值；阈值判定以**单会话** `[COUNT]` 达到阈值为准。
+- The tier 1 queue is sorted by challenge difficulty (`DIFF_RANK`), so easy challenges go first and points accumulate quickly;
+- **skipped semantics**: a challenge that did not run at all this round because its target failed to start does not count as attempted and is not promoted; it stays in its current tier for the next round;
+- At each tier, `--sessions` **black-box** worker sessions run concurrently on the same challenge (black-box throughout, no source-code audit); each session explores independently and signs its entries with its own session number;
+- All workers belong to the main wave (wave=2) and all count toward the step threshold; the threshold is reached when a **single session's** `[COUNT]` reaches it.
 
-### 4.2 单轮执行流程（`run_parallel_stage`）
+### 4.2 Single-round flow (`run_parallel_stage`)
 
 ```mermaid
 flowchart TD
-    A[进入一轮 stage<br/>codes + 阈值 + 提示策略] --> B{遍历每道题}
-    B --> E[platform.start 启动靶场<br/>端口就绪探测 ≤60s]
-    E --> F{拿到地址?}
-    F -->|否| G[本轮跳过 skipped]
-    F -->|是| H{prefetch_hint?}
-    H -->|是| I[platform.hint 读取提示<br/>写 hint_code.txt]
-    H -->|否| J
-    I --> J[写 desc_code.txt<br/>spawn N 个 worker 间隔 2s]
-    J --> K[reader 线程逐行监控:<br/>COUNT 阈值 / flag 进度 X-Y / 最终 JSON]
-    K --> L{任一 worker 解出<br/>且 flag 集齐?}
-    L -->|是| M[置 winner<br/>整组 killpg 停止]
-    L -->|否, 达阈值| N[stop_threshold<br/>整组停止]
-    M --> O[统一 platform.close<br/>compose 题目 down -v]
+    A[Enter a stage round<br/>codes + threshold + hint policy] --> B{For each challenge}
+    B --> E[platform.start starts target<br/>port readiness probe ≤60s]
+    E --> F{Got an address?}
+    F -->|No| G[Skip this round: skipped]
+    F -->|Yes| H{prefetch_hint?}
+    H -->|Yes| I[platform.hint reads hint<br/>writes hint_code.txt]
+    H -->|No| J
+    I --> J[Write desc_code.txt<br/>spawn N workers 2s apart]
+    J --> K[Reader threads monitor line by line:<br/>COUNT threshold / flag progress X-Y / final JSON]
+    K --> L{Any worker solved it<br/>with all flags in?}
+    L -->|Yes| M[Set winner<br/>killpg the whole group]
+    L -->|No, threshold reached| N[stop_threshold<br/>stop the whole group]
+    M --> O[platform.close for all<br/>compose challenges run down -v]
     N --> O
-    O --> P[返回 flagged / remaining / skipped]
+    O --> P[Return flagged / remaining / skipped]
 ```
 
-### 4.3 并发名额限流
+### 4.3 Concurrency slot limit
 
-- 同时在跑的题目数受 `MAX_INFLIGHT = CRUISER_MAX_ACTIVE`（默认 3）约束：每题一组 worker + solver 与一个靶场，限流用于控制本机资源与 LLM 配额；
-- 调度循环每轮检查 `_inflight_count() >= MAX_INFLIGHT` 即停止派发新题，剩余题目留待下一轮。
+- The number of challenges running at the same time is bounded by `MAX_INFLIGHT = CRUISER_MAX_ACTIVE` (default 3): each challenge has one group of workers + solvers and one target, and the limit controls local resources and LLM quota;
+- On every pass the scheduling loop checks `_inflight_count() >= MAX_INFLIGHT` and stops dispatching new challenges when it is true; the remaining challenges wait for the next pass.
 
 ---
 
-## 5. 多会话协作机制
+## 5. Multi-session collaboration
 
-多会话并发的核心矛盾是：**既要独立探索（视角多样性），又要共享发现（避免重复劳动）**。Cruiser 用「共享黑板 + 任务板 + 硬注入钩子 + 策展 watcher」四件套解决。
+The core tension in running sessions concurrently is: **they should explore independently (diversity of viewpoints) yet share findings (avoid duplicate work)**. Cruiser solves this with a four-part kit: "shared blackboard + task board + hard-injection hooks + curation watcher".
 
-### 5.1 协作机制总览
+### 5.1 Collaboration overview
 
 ```mermaid
 flowchart LR
-    subgraph 会话侧
-        C1[会话 #1] 
-        C2[会话 #2]
-        C3[会话 #3]
+    subgraph Sessions
+        C1[Session #1]
+        C2[Session #2]
+        C3[Session #3]
     end
 
-    subgraph 注入通道
-        HK["blackboard_hook.py<br/>SessionStart / PostToolUse(每10步)"]
+    subgraph Injection
+        HK["blackboard_hook.py<br/>SessionStart / PostToolUse (every 10 steps)"]
     end
 
-    subgraph 文件总线["reports/（fcntl 锁 + 原子重写）"]
-        BB["info_&lt;code&gt;.txt 共享黑板"]
-        TB["tasks_&lt;code&gt;.txt 任务板<br/>+ .claimed 认领日志"]
+    subgraph FileBus["reports/ (fcntl lock + atomic rewrite)"]
+        BB["info_&lt;code&gt;.txt shared blackboard"]
+        TB["tasks_&lt;code&gt;.txt task board<br/>+ .claimed claim log"]
         DK["desc/hint_&lt;code&gt;.txt"]
     end
 
-    subgraph 策展侧
-        WA["Watcher LLM (deepseek-v4-pro)<br/>默认每 4 步后台审阅"]
+    subgraph Curation
+        WA["Watcher LLM (deepseek-v4-pro)<br/>background review every 4 steps by default"]
     end
 
-    C1 & C2 & C3 -->|写入发现/任务回报| BB
+    C1 & C2 & C3 -->|write findings / task results| BB
     WA -->|add/update/remove| BB
     WA -->|publish/retire| TB
-    C1 & C2 & C3 -->|claim 认领(先到先得)| TB
+    C1 & C2 & C3 -->|claim, first come first served| TB
     BB & TB & DK --> HK
-    HK -->|additionalContext 硬注入| C1 & C2 & C3
-    C1 & C2 & C3 -.->|默认每4步活动摘要触发| WA
+    HK -->|additionalContext hard injection| C1 & C2 & C3
+    C1 & C2 & C3 -.->|activity summary every 4 steps by default| WA
 ```
 
-### 5.2 上下文硬注入（`blackboard_hook.py`）
+### 5.2 Hard context injection (`blackboard_hook.py`)
 
-不依赖模型自觉去读黑板文件，而是在 worker 工作目录写入 `.claude/settings.json` 注册 Claude Code 钩子，让内容**物理进入模型上下文**：
+Instead of relying on the model to choose to read the blackboard file, Cruiser writes `.claude/settings.json` into the worker's working directory to register Claude Code hooks, so the content **enters the model context directly**:
 
-| 钩子事件 | 触发时机 | 注入内容 |
-|----------|----------|----------|
-| `SessionStart` | 会话开局一次 | 题目描述 + 题目提示 + 当前黑板（各若非空） |
-| `PostToolUse` | 每 10 次工具调用 | 上述三项的最新内容，并标注「请关注并利用其他会话的新发现」 |
+| Hook event | When it fires | What it injects |
+|------------|---------------|-----------------|
+| `SessionStart` | Once at the start of the session | Challenge description + challenge hint + current blackboard (each if non-empty) |
+| `PostToolUse` | Every 10 tool calls | The latest content of the three items above, with a note asking the model to watch for and use other sessions' new findings |
 
-- 注入通道为 `hookSpecificOutput.additionalContext`；
-- 单项截断 3000 字符（黑板取**尾部** 3000 字符，保留最新发现），防止上下文被协作信息淹没；
-- 钩子按 `CRUISER_CHALLENGE_CODE` 定位该题的文件，无内容可注入时不输出任何东西（零开销）。
+- The injection channel is `hookSpecificOutput.additionalContext`;
+- Each item is truncated to 3000 characters (the blackboard keeps its **last** 3000 characters, preserving the newest findings), so collaboration information does not drown the context;
+- The hook finds the challenge's files through `CRUISER_CHALLENGE_CODE`, and prints nothing when there is nothing to inject (zero overhead).
 
-### 5.3 共享黑板与策展 Watcher
+### 5.3 Shared blackboard and curation watcher
 
-黑板 `reports/info_<code>.txt` 保存各会话已发现的关键事实（口令、路径、端点、结论等），条目格式：
+The blackboard `reports/info_<code>.txt` holds the key facts each session has found (credentials, paths, endpoints, conclusions, etc.). Entry format:
 
 ```
-[2026-08-15 12:00:00] 会话: 2
-关键信息: /admin 存在越权，无需鉴权可读取用户列表
+[2026-08-15 12:00:00] session: 2
+info: /admin has broken access control; the user list can be read without authentication
 ------------------------------------------------------------
 ```
 
-**Watcher 策展**（`_watcher_curate_blackboard`）：
+**Watcher curation** (`_watcher_curate_blackboard`):
 
-- 每个会话默认每 4 步（`CRUISER_WATCHER_EVERY`）在后台线程触发一次（单 watcher 并发闸 `busy` 标志防重入）；会话结束时强制补一次尾部采集（30s join 超时，防止 daemon 线程随进程退出丢失最后发现）；
-- watcher LLM（`deepseek-v4-pro`，策展与方向规划需要更强推理）基于：题目描述 + 提示 + 最近活动窗口（默认 48 条，近 12 条保留全文）+ 当前黑板 + 任务板（待认领/执行中），产出结构化 JSON：
-  - `add`（≤3 条）：提取新关键信息（普通条目不超过 80 字）；**不写入具体 flag 值，也不新增 `[flag方法]`**；
-  - `update`（≤3 条）：修正过时/错误条目（保留原头部的时间戳与会话归属，仅替换信息内容；不改 `[flag方法]`）；
-  - `remove`（≤3 条）：删除失效条目（含具体 flag 值的条目一律删；`[flag方法]` 除非漏了 flag 字面量否则不删）；
-  - `suggest_tasks`（≤2 条）：向任务板推荐新探索方向；
-  - `retire_tasks`（≤3 条）：下架重复/过时方向；
-- **并发安全应用变更**：LLM 审阅基于无锁快照；应用变更时持文件锁重读最新内容，按**内容模糊匹配**（归一化包含关系或字符 bigram 重叠系数 ≥ 0.6）定位条目——不用行号，规避并发编辑导致的行号漂移；写回走临时文件 + `os.replace` 原子替换；
-- watcher 失败静默吞掉，绝不影响解题主流程；
-- 附带职责：从活动与黑板中提取 `flag{...}` 候选并程序化兜底提交——**watcher 也能交 flag**（同一段超过 5 个候选视为爆破输出，不自动交）；
-- **`[flag方法]`**：首次提交成功时由该会话分叉写入（漏洞点/请求/步骤，不含 flag 字面量），供其他会话复现剩余 flag；watcher 不增删改。
+- Each session triggers it in a background thread every 4 steps by default (`CRUISER_WATCHER_EVERY`), with a single-watcher `busy` flag guarding against re-entry; when the session ends, one final tail collection is forced (30s join timeout, so the last findings are not lost when the daemon thread exits with the process);
+- The watcher LLM (`deepseek-v4-pro`, because curation and direction planning need stronger reasoning) works from: challenge description + hint + recent activity window (48 entries by default, the latest 12 in full) + current blackboard + task board (pending/in progress), and produces structured JSON:
+  - `add` (≤3): extract new key information (regular entries at most 80 characters); **never writes concrete flag values, and never adds `[flag-method]` entries**;
+  - `update` (≤3): correct outdated/wrong entries (keeps the original header's timestamp and session attribution, only replaces the information; never changes `[flag-method]`);
+  - `remove` (≤3): delete stale entries (any entry containing a concrete flag value is always deleted; `[flag-method]` is not deleted unless it leaks a flag literal);
+  - `suggest_tasks` (≤2): recommend new exploration directions to the task board;
+  - `retire_tasks` (≤3): retire duplicate/outdated directions;
+- **Concurrency-safe application of changes**: the LLM review works from a lock-free snapshot; when applying changes, the latest content is re-read under the file lock and entries are located by **fuzzy content match** (normalized containment, or a character-bigram overlap coefficient ≥ 0.6) rather than by line number, avoiding line-number drift from concurrent edits; write-back goes through a temp file + atomic `os.replace`;
+- Watcher failures are swallowed silently and never affect the main solving flow;
+- Side duty: extract `flag{...}` candidates from activity and the blackboard and submit them programmatically as a fallback, so **the watcher can submit flags too** (more than 5 candidates in one chunk is treated as brute-force output and not submitted automatically);
+- **`[flag-method]`**: written by a fork of the session on its first successful submission (vulnerable point/request/steps, without the flag literal), so other sessions can reproduce the remaining flags; the watcher never adds, deletes, or edits it.
 
-### 5.4 探索方向任务板（`cruiser/taskboard.py`）
+### 5.4 Exploration task board (`cruiser/taskboard.py`)
 
-任务板 `reports/tasks_<code>.txt` 用于把「接下来值得试什么」显式化，行格式 `[t-xxxxxx] 方向内容`：
+The task board `reports/tasks_<code>.txt` makes "what is worth trying next" explicit. Line format: `[t-xxxxxx] direction text`:
 
 ```mermaid
 sequenceDiagram
     participant WA as Watcher
-    participant L as 锁(tasks.lock)
+    participant L as Lock (tasks.lock)
     participant TB as tasks_code.txt
     participant CL as tasks_code.txt.claimed
     participant W as Worker/Solver
 
-    WA->>L: publish_task(方向)
-    L->>TB: 判重(待认领+近期已认领)<br/>板满(≥5)拒发
-    L-->>WA: 写入/拒绝
+    WA->>L: publish_task(direction)
+    L->>TB: Dedupe (pending + recently claimed)<br/>reject when the board is full (≥5)
+    L-->>WA: Written / rejected
     W->>L: claim_task(worker_id)
-    L->>TB: 锁内找到并擦除条目（先到先得）
-    L->>CL: 追加认领记录 ts|worker|text
-    L-->>W: 返回方向 / None(已被抢)
-    W->>BB: report_task 完成回报（写入黑板）
+    L->>TB: Find and erase the entry under the lock (first come, first served)
+    L->>CL: Append claim record ts|worker|text
+    L-->>W: Return direction / None (already taken)
+    W->>BB: report_task completion result (written to the blackboard)
 ```
 
-关键参数与规则：
+Key parameters and rules:
 
-| 项 | 值 | 说明 |
-|----|----|------|
-| `_MAX_PENDING` | 5 | 板上最多待认领方向数，超过不再发布 |
-| `_CLAIMED_TTL_S` | 45 分钟 | 认领擦除后的方向仍参与判重（防 watcher 重复发布）；超时自动解冻，避免认领方异常死亡导致方向永久锁死 |
-| 判重算法 | 归一化包含 / bigram ≥ 0.6 | 消除路径分隔符、标点、空白差异的相似方向判定 |
-| 认领语义 | 锁内擦除 | 多 worker 并发认领同一方向时只有一个成功 |
+| Item | Value | Description |
+|------|-------|-------------|
+| `_MAX_PENDING` | 5 | Maximum number of pending directions on the board; nothing more is published beyond that |
+| `_CLAIMED_TTL_S` | 45 minutes | Directions erased by a claim still take part in deduplication (so the watcher does not republish them); they unfreeze automatically after the timeout, so a claimer that dies abnormally cannot lock a direction forever |
+| Dedup algorithm | Normalized containment / bigram ≥ 0.6 | Judges similar directions while ignoring differences in path separators, punctuation, and whitespace |
+| Claim semantics | Erase under the lock | When several workers claim the same direction concurrently, only one succeeds |
 
-### 5.5 Solver 定向执行
+### 5.5 Directed solver execution
 
-除普通探索 worker 外，每题还有一个 `solver_driver` 线程：
+Besides the regular exploration workers, each challenge has a `solver_driver` thread:
 
-- 维持 ≤ `CRUISER_MAX_SOLVERS`（默认 3）个并发 solver；
-- 每个 solver 从任务板 **FIFO 认领一条方向**，以聚焦的系统提示词（`CLAUDE_SOLVER_SYSTEM_PROMPT` + 任务模板）启动定向会话，回合上限 `CRUISER_SOLVER_MAX_TURNS`（默认 40），模型 `CRUISER_SOLVER_MODEL`（默认 `deepseek-v4-flash`）；
-- solver 退出即回收补位；整题出 flag 或本轮结束时停止并清杀所有 solver；
-- 与探索 worker 的关系：探索 worker 广撒网、自然发现并写黑板；watcher 把「值得深挖但未做」的方向显式化到任务板；solver 按需领任务做定向突破，三者形成「探索 → 策展 → 攻坚」的闭环。
+- It keeps ≤ `CRUISER_MAX_SOLVERS` (default 3) concurrent solvers;
+- Each solver **claims one direction FIFO** from the task board and starts a directed session with a focused system prompt (`CLAUDE_SOLVER_SYSTEM_PROMPT` + task template), with a turn limit of `CRUISER_SOLVER_MAX_TURNS` (default 40) and model `CRUISER_SOLVER_MODEL` (default `deepseek-v4-flash`);
+- When a solver exits, its slot is reclaimed and refilled; when the challenge's flag is found or the round ends, all solvers are stopped and killed;
+- How it relates to the exploration workers: exploration workers cast a wide net, find things naturally, and write the blackboard; the watcher makes "worth digging into but not yet done" directions explicit on the task board; solvers take tasks on demand for directed breakthroughs. Together the three form an "explore → curate → attack" loop.
 
 ---
 
-## 6. Flag 权威校验与多 Flag 处理
+## 6. Authoritative flag verification and multi-flag handling
 
-### 6.1 权威校验原则
+### 6.1 Authoritative verification principle
 
-**不信任模型输出的任何文本标记**（包括模型自称「提交成功」），flag 有效性唯一以本地平台的校验结果为准：
+**No text marker in model output is trusted** (including the model claiming "submitted successfully"); flag validity is judged solely by the local platform's verification result:
 
 ```mermaid
 flowchart TD
-    A[捕获 flag 候选<br/>submit 工具调用 / assistant 文本 / 工具结果] --> B{形态合法?<br/>_looks_like_flag}
-    B -->|否| Z[丢弃]
-    B -->|是| C{已核实过?}
-    C -->|是| Z
-    C -->|否| D[框架亲自调用 submit_flag_outcome<br/>提交本地平台]
-    D --> E{平台返回 correct / duplicate?}
-    E -->|是| F[记录进度；全部 flag 到手才停整题]
-    E -->|否| G[继续解题<br/>候选留待收尾复核]
+    A[Capture flag candidate<br/>submit tool call / assistant text / tool result] --> B{Valid shape?<br/>_looks_like_flag}
+    B -->|No| Z[Discard]
+    B -->|Yes| C{Already verified?}
+    C -->|Yes| Z
+    C -->|No| D[Framework itself calls submit_flag_outcome<br/>submits to the local platform]
+    D --> E{Platform returns correct / duplicate?}
+    E -->|Yes| F[Record progress; stop the challenge only when all flags are in]
+    E -->|No| G[Keep solving<br/>candidate kept for wrap-up recheck]
 ```
 
-- `_verify_flag()` 对同一候选只核实一次（`verified` 集合去重），避免重复提交；返回结构化 `FlagSubmitOutcome`（含 `correct/total`），多 flag 未集齐时会话继续；
-- **当场校验**：模型一调用提交工具，框架立即亲自向本地平台核实；
-- **收尾补交**：会话结束（出 flag / 达轮数上限 / 自然结束）时，对全部合法候选按长度降序逐个补交——覆盖「flag 在最后一回合找到、提交命令被 `--max-turns` 切断」等情况，命中打印 `[FLAG RECOVERED]`；
-- watcher 策展前也先执行一轮候选兜底提交（即便无可用 watcher LLM 也能补交）；
-- 同一段文本出现超过 5 个 `flag{...}` 视为爆破/枚举输出，框架不自动提交（模型主动调用 `submit_flag.py` 仍放行）。
+- `_verify_flag()` verifies each candidate only once (deduplicated by the `verified` set) to avoid repeat submissions; it returns a structured `FlagSubmitOutcome` (with `correct/total`), and the session keeps going while a multi-flag challenge is incomplete;
+- **On-the-spot verification**: as soon as the model calls the submit tool, the framework itself checks with the local platform;
+- **Wrap-up resubmission**: when the session ends (flag found / turn limit reached / natural end), every valid candidate is resubmitted one by one in descending length order. This covers cases like "the flag was found in the last turn and the submit command was cut off by `--max-turns`"; a hit prints `[FLAG RECOVERED]`;
+- Before curating, the watcher also runs one round of fallback candidate submission (so resubmission works even with no watcher LLM available);
+- More than 5 `flag{...}` in the same chunk of text is treated as brute-force/enumeration output and is not submitted automatically by the framework (the model calling `submit_flag.py` itself is still allowed).
 
-### 6.2 多 Flag 题目的完成判定
+### 6.2 Completion for multi-flag challenges
 
-一道题可能有多个 flag（题目定义的 `flags` 列表长度 > 1），规则：
+A challenge may have several flags (the definition's `flags` list has length > 1). Rules:
 
-- `submit_flag` 的回执包含「flag 进度 X/Y」，框架记入 `FlagSubmitOutcome`；
-- **仅当已交对数 ≥ flag 总数才判定整题解出**、置 winner 停止整组（调度器以本地平台进度为准，不解析 worker 的最终 JSON）；
-- 单会话内未集齐全部 flag 时继续运行，不因交对一枚就结束。
+- The `submit_flag` receipt includes "flag progress X/Y", which the framework records in `FlagSubmitOutcome`;
+- **The challenge counts as solved only when the number of accepted flags ≥ the total**, at which point a winner is set and the whole group stops (the scheduler goes by the local platform's progress and does not parse the worker's final JSON);
+- A session that has not collected all flags keeps running; it does not stop after one correct flag.
 
 ---
 
-## 7. LLM 接入与多模型路由
+## 7. LLM access and multi-model routing
 
-### 7.1 表驱动提供方注册表（`cruiser/llm.py`）
+### 7.1 Table-driven provider registry (`cruiser/llm.py`)
 
-所有「连哪家模型/端点/用哪把 key」的逻辑集中在 `llm.py`，采用**注册表 + 模型名前缀路由**：
+All logic for "which model/endpoint/key to use" lives in `llm.py`, using a **registry + model-name prefix routing**:
 
 ```mermaid
 flowchart LR
-    M[模型名] --> P{前缀匹配<br/>MODEL_PREFIX_TO_PROVIDER}
-    P -->|"deepseek*"| DS[deepseek 提供方<br/>DEEPSEEK_API_KEY]
-    P -->|"kimi-* / moonshot*"| KM[kimi 提供方<br/>KIMI_API_KEY]
-    P -->|"glm-* / chatglm* / zhipu*"| GLM[glm 提供方<br/>GLM_API_KEY]
-    P -->|未命中| DS
-    DS --> E1[Anthropic 端点<br/>claude CLI 用]
-    DS --> E2[OpenAI 兼容端点<br/>langchain watcher 用]
+    M[Model name] --> P{Prefix match<br/>MODEL_PREFIX_TO_PROVIDER}
+    P -->|"deepseek*"| DS[deepseek provider<br/>DEEPSEEK_API_KEY]
+    P -->|"kimi-* / moonshot*"| KM[kimi provider<br/>KIMI_API_KEY]
+    P -->|"glm-* / chatglm* / zhipu*"| GLM[glm provider<br/>GLM_API_KEY]
+    P -->|no match| DS
+    DS --> E1[Anthropic endpoint<br/>used by claude CLI]
+    DS --> E2[OpenAI-compatible endpoint<br/>used by langchain watcher]
     KM --> E1
     KM --> E2
     GLM --> E1
     GLM --> E2
 ```
 
-| 提供方 | 密钥环境变量 | 默认端点 | 覆盖变量（Anthropic / OpenAI） |
-|--------|--------------|----------|--------------------------------|
+| Provider | Key env var | Default endpoint | Override vars (Anthropic / OpenAI) |
+|----------|-------------|------------------|------------------------------------|
 | deepseek | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/{anthropic,v1}` | `ANTHROPIC_BASE_URL` / `DEEPSEEK_BASE_URL` |
 | kimi (moonshot) | `KIMI_API_KEY` | `https://api.moonshot.cn/{anthropic,v1}` | `KIMI_ANTHROPIC_BASE_URL` / `KIMI_BASE_URL` |
-| glm（TokenHub） | `GLM_API_KEY` | `https://tokenhub.tencentmaas.com`（OpenAI 兼容 `/v1`） | `GLM_ANTHROPIC_BASE_URL` / `GLM_BASE_URL` |
+| glm (TokenHub) | `GLM_API_KEY` | `https://tokenhub.tencentmaas.com` (OpenAI-compatible `/v1`) | `GLM_ANTHROPIC_BASE_URL` / `GLM_BASE_URL` |
 
-端点解析优先级：**显式环境变量覆盖 > 官方默认端点**。新接一家提供方只需在 `PROVIDERS` 注册表加一条配置 + 在 `MODEL_PREFIX_TO_PROVIDER` 加前缀，无需改任何调用方。
+Endpoint resolution priority: **explicit environment variable override > official default endpoint**. Adding a provider takes one entry in the `PROVIDERS` registry + a prefix in `MODEL_PREFIX_TO_PROVIDER`, with no changes to any caller.
 
-### 7.2 双通道消费
+### 7.2 Two consumption channels
 
-| 消费方 | 通道 | 配置来源 |
-|--------|------|----------|
-| 解题引擎（claude CLI） | Anthropic 兼容端点（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`） | `get_claude_provider_env()`，密钥缺失时回退显式 `ANTHROPIC_AUTH_TOKEN` |
-| watcher / 旧 ReAct 引擎 | OpenAI 兼容端点（langchain `ChatOpenAI`） | `_build_chat_openai()`，无密钥/依赖时返回 None 静默降级 |
+| Consumer | Channel | Configuration source |
+|----------|---------|----------------------|
+| Solving engine (claude CLI) | Anthropic-compatible endpoint (`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`) | `get_claude_provider_env()`; falls back to an explicit `ANTHROPIC_AUTH_TOKEN` when the key is missing |
+| Watcher / old ReAct engine | OpenAI-compatible endpoint (langchain `ChatOpenAI`) | `_build_chat_openai()`; returns None and degrades silently when the key/dependency is missing |
 
-### 7.3 多模型混编与温度分片
+### 7.3 Mixed models and temperature sharding
 
-- `--worker-models deepseek-v4-flash,deepseek-v4-flash,kimi-k3`：worker 数量 = 清单长度（覆盖 `--sessions`），第 i 个 worker 用第 i 个模型，不同厂商可混搭（按模型名自动路由端点与密钥）；
-- 默认模型分工：解题 `deepseek-v4-flash`（`DEEPSEEK_MODEL`/`ANTHROPIC_MODEL` 覆盖）、watcher `deepseek-v4-pro`（`WATCHER_MODEL` 覆盖）、solver `deepseek-v4-flash`（`CRUISER_SOLVER_MODEL` 覆盖）；
-- **温度分片**（langchain 路径）：按 worker 编号在 `[CRUISER_TEMP_MIN, CRUISER_TEMP_MAX]`（默认 0.0 ~ 0.9）线性分配——低编号会话确定性高、高编号会话发散性强，用温度梯度制造探索多样性。
-
----
-
-## 8. 本地题目平台
-
-题目平台由 `cruiser/challenges.py` 实现，进程内单例 `get_platform()`，调度器、worker、solver 与 `tools/submit_flag.py` 各自实例化、经磁盘状态共享进度：
-
-| 操作 | 接口 | 行为 |
-|------|------|------|
-| 列出题目与进度 | `list_challenges()` | 读题目定义 + 状态文件，返回每题 `correct / total / completed`；调度器 1s 周期轮询，过滤已解题 |
-| 启动靶场 | `start(code)` | `target` 题目直接返回地址；`compose` 题目执行 `docker compose -p cruiser_<code> -f <file> up -d`，返回 `addresses`（不带协议头补 `http://`） |
-| 关闭靶场 | `close(code)` | `target` 题目为空操作；`compose` 题目执行 `docker compose -p cruiser_<code> -f <file> down -v` |
-| 读取提示 | `hint(code)` | 返回题目定义的 `hint`；**三级才调用**，落盘 `hint_<code>.txt` 全会话共享 |
-| 提交 flag | `submit(code, flag)` | 明文精确匹配或 `sha256:<hex>` 摘要匹配；返回 `(correct, duplicate, correct_count, total)`；已交对的 flag 再交视为幂等成功 |
-| 清理残留 | `down_leftovers()` | `docker compose ls -a` 找出所有 `cruiser_*` 项目并 `down -v`（启动与退出时各一次） |
-| 查询进度 | `progress(code)` | 返回 `(已交对数, flag 总数)` |
-
-**跨进程状态**：进度保存在 `reports/_platform_state.json`（`{"challenges": {"<code>": {"solved": [flag 下标...]}}}`），读改写全程持有 `_platform_state.json.lock` 的 `fcntl` 锁，写回走临时文件 + `os.replace` 原子替换；状态文件损坏时备份为 `.corrupt` 后从空状态继续。按下标记录，因此同一 flag 被多个进程并发提交也只计一次。
-
-**题目定义热加载**：按 YAML 文件 mtime 缓存，运行中修改定义文件会自动重新加载。
-
-靶场就绪探测（`CRUISER_CONTAINER_WARMUP`，默认 60s）：拿到地址后主动探测目标端口，可连即拉起会话；**超时也放行**交由 LLM 解题，防止慢启动卡死调度。
-
-命令行：`python -m cruiser.challenges list | reset [CODE…] | down`。
-
-错误处理：
-
-| 错误 | 处理策略 |
-|------|----------|
-| `ConfigError`（定义文件缺失/格式非法） | 调度器启动即报错退出，指出出错题目与字段 |
-| `UnknownChallenge`（题目不在定义中） | 提交返回错误（definitive，不重试） |
-| `StartError`（compose up 失败 / 未安装 Docker） | 本轮跳过（skipped），下轮重试 |
-| 关闭失败 | 打印 WARN，不阻塞调度；退出时 `down_leftovers()` 兜底 |
+- `--worker-models deepseek-v4-flash,deepseek-v4-flash,kimi-k3`: worker count = list length (overrides `--sessions`); worker i uses model i, and vendors can be mixed (endpoint and key are routed automatically by model name);
+- Default model roles: solving `deepseek-v4-flash` (override with `DEEPSEEK_MODEL`/`ANTHROPIC_MODEL`), watcher `deepseek-v4-pro` (override with `WATCHER_MODEL`), solver `deepseek-v4-flash` (override with `CRUISER_SOLVER_MODEL`);
+- **Temperature sharding** (langchain path): temperatures are assigned linearly by worker number across `[CRUISER_TEMP_MIN, CRUISER_TEMP_MAX]` (default 0.0 ~ 0.9). Low-numbered sessions are more deterministic and high-numbered ones more divergent, so the temperature gradient creates exploration diversity.
 
 ---
 
-## 9. 题目定义格式（YAML）
+## 8. Local challenge platform
+
+The challenge platform is implemented in `cruiser/challenges.py` as an in-process singleton `get_platform()`. The scheduler, workers, solvers, and `tools/submit_flag.py` each instantiate their own and share progress through on-disk state:
+
+| Operation | Interface | Behavior |
+|-----------|-----------|----------|
+| List challenges and progress | `list_challenges()` | Reads challenge definitions + state file and returns `correct / total / completed` per challenge; the scheduler polls it every 1s and filters out solved challenges |
+| Start target | `start(code)` | `target` challenges return the address directly; `compose` challenges run `docker compose -p cruiser_<code> -f <file> up -d` and return `addresses` (`http://` is added when no scheme is given) |
+| Shut down target | `close(code)` | No-op for `target` challenges; `compose` challenges run `docker compose -p cruiser_<code> -f <file> down -v` |
+| Read hint | `hint(code)` | Returns the `hint` from the challenge definition; **only called at tier 3**, saved to `hint_<code>.txt` and shared by all sessions |
+| Submit flag | `submit(code, flag)` | Exact plain-text match or `sha256:<hex>` digest match; returns `(correct, duplicate, correct_count, total)`; resubmitting an already-accepted flag is an idempotent success |
+| Clean up leftovers | `down_leftovers()` | `docker compose ls -a` finds all `cruiser_*` projects and runs `down -v` on them (once at startup and once at exit) |
+| Query progress | `progress(code)` | Returns `(accepted count, total flags)` |
+
+**Cross-process state**: progress is stored in `reports/_platform_state.json` (`{"challenges": {"<code>": {"solved": [flag indexes...]}}}`). Every read-modify-write holds the `fcntl` lock on `_platform_state.json.lock`, and write-back goes through a temp file + atomic `os.replace`; a corrupted state file is backed up as `.corrupt` and the platform continues from an empty state. Progress is recorded by index, so the same flag submitted concurrently by several processes counts only once.
+
+**Hot reload of challenge definitions**: cached by the YAML file's mtime, so editing the definition file during a run reloads it automatically.
+
+Target readiness probe (`CRUISER_CONTAINER_WARMUP`, default 60s): after getting the address, the target port is probed actively and sessions start once it accepts connections; **on timeout they start anyway** and the LLM takes over, so a slow start cannot hang the scheduler.
+
+CLI: `python -m cruiser.challenges list | reset [CODE…] | down`.
+
+Error handling:
+
+| Error | Strategy |
+|-------|----------|
+| `ConfigError` (definition file missing/malformed) | The scheduler errors out at startup, naming the challenge and field at fault |
+| `UnknownChallenge` (challenge not in the definitions) | Submission returns an error (definitive, no retry) |
+| `StartError` (compose up failed / Docker not installed) | Skipped this round (skipped), retried next round |
+| Shutdown failure | Prints WARN without blocking scheduling; `down_leftovers()` is the fallback at exit |
+
+---
+
+## 9. Challenge definition format (YAML)
 
 ```yaml
 challenges:
-  - code: WEB-1                  # 必填，形如 <字母数字>-<数字>（Agent 侧按此形态识别 submit_flag.py 调用）
-    difficulty: easy             # easy / medium / hard（默认 easy），按 DIFF_RANK 排序
-    description: 题目描述          # 写入 desc_<code>.txt，开局经钩子注入
-    hint: 可选提示                 # 三级起才下发
-    flags:                       # 必填，至少一个
-      - flag{plain}              # 明文
-      - sha256:<64 位十六进制>     # 摘要（答案不必明文存放）
-    target: http://127.0.0.1:8080          # 靶场二选一 ①：已运行服务（字符串或列表）
+  - code: WEB-1                  # Required, of the form <alphanumeric>-<digits> (the agent recognizes submit_flag.py calls by this shape)
+    difficulty: easy             # easy / medium / hard (default easy), sorted by DIFF_RANK
+    description: Challenge description  # Written to desc_<code>.txt and injected by the hook at session start
+    hint: Optional hint          # Only given from tier 3 onward
+    flags:                       # Required, at least one
+      - flag{plain}              # Plain text
+      - sha256:<64 hex digits>   # Digest (the answer need not be stored in plain text)
+    target: http://127.0.0.1:8080          # Target option 1: a running service (string or list)
   - code: WEB-2
-    flags: ["flag{x}"]                     # 行内列表中的 flag 含花括号，必须加引号
-    compose: web2/docker-compose.yml       # 靶场二选一 ②：相对本 YAML 所在目录
-    addresses: ["127.0.0.1:8082"]          # compose 必填：交给 Agent 的地址
+    flags: ["flag{x}"]                     # Flags inside an inline list contain braces and must be quoted
+    compose: web2/docker-compose.yml       # Target option 2: relative to this YAML's directory
+    addresses: ["127.0.0.1:8082"]          # Required with compose: addresses given to the agent
 ```
 
-校验规则：未知字段、重复 `code`、`target` 与 `compose` 同时出现或都缺失、compose 文件不存在、`sha256:` 摘要格式错误等均在加载时报错。示例见 `challenges.example.yaml` 与 `examples/web-demo/`（Flask 路径穿越演示题）。
+Validation rules: unknown fields, duplicate `code`, `target` and `compose` both present or both missing, a missing compose file, malformed `sha256:` digests, and similar problems all raise errors at load time. See `challenges.example.yaml` and `examples/web-demo/` (a Flask path traversal demo challenge) for examples.
 
 ---
 
-## 10. 工具链与离线知识库
+## 10. Toolchain and offline knowledge base
 
-### 10.1 自研 CLI 封装（`tools/`，供 Agent 经 Bash 调用）
+### 10.1 In-house CLI wrappers (`tools/`, called by the agent through Bash)
 
-| 工具 | 功能 | 设计要点 |
-|------|------|----------|
-| `submit_flag.py` | 向本地平台提交并校验 flag | flag 提交的唯一通道；回执含进度 X/Y |
-| `dirsearch_scan.py` | 目录扫描 | **跨会话去重**：同一 URL 全会话只实扫一次，其余阻塞复用报告；报告落盘防上下文溢出 |
-| `task_board.py` | 任务板 `list/claim/report` | Agent 侧的命令行入口 |
-| `decompile.py` | PyGhidra 无头反编译 | 输出 C 伪码，并标注被编译器消除的取数、switch 各 case 语义与未确认 opcode、数据引用 |
+| Tool | Purpose | Design points |
+|------|---------|---------------|
+| `submit_flag.py` | Submit a flag to the local platform and verify it | The only channel for flag submission; the receipt includes progress X/Y |
+| `dirsearch_scan.py` | Directory scan | **Deduplicated across sessions**: each URL is scanned once across all sessions, the rest block and reuse the report; the report is saved to disk to prevent context overflow |
+| `task_board.py` | Task board `list/claim/report` | The agent-side command-line entry point |
+| `decompile.py` | PyGhidra headless decompiler | Prints C pseudocode and annotates loads the compiler eliminated, the meaning of each switch case, unconfirmed opcodes, and data references |
 
-### 10.2 预装安全工具集
+### 10.2 Preinstalled security tools
 
-| 类别 | 工具 |
-|------|------|
-| Web/渗透 | `dirsearch` / `sqlmap` / `fenjing`（SSTI）/ `nuclei`（内置模板库）/ `ffuf` / `whatweb` / Metasploit + PostgreSQL |
-| 逆向/Pwn | Ghidra + PyGhidra / `radare2` / `pwntools` / `angr` / `ropper` / `one_gadget` / GDB |
-| 密码/取证 | `pycryptodome` / `gmpy2` / `sympy` / `z3` / `steghide` / `zsteg` / `binwalk` |
-| 智能合约 | Foundry（`forge`/`cast`/`anvil`）/ 多版本 `solc` / `slither` / `web3.py` |
+| Category | Tools |
+|----------|-------|
+| Web/pentest | `dirsearch` / `sqlmap` / `fenjing` (SSTI) / `nuclei` (built-in template library) / `ffuf` / `whatweb` / Metasploit + PostgreSQL |
+| Reversing/Pwn | Ghidra + PyGhidra / `radare2` / `pwntools` / `angr` / `ropper` / `one_gadget` / GDB |
+| Crypto/forensics | `pycryptodome` / `gmpy2` / `sympy` / `z3` / `steghide` / `zsteg` / `binwalk` |
+| Smart contracts | Foundry (`forge`/`cast`/`anvil`) / multiple `solc` versions / `slither` / `web3.py` |
 
-`list_security_tools` 工具供 Agent 探测环境内可用的安全工具及版本。
+The `list_security_tools` tool lets the agent discover which security tools and versions are available in the environment.
 
-### 10.3 离线知识库与字典
+### 10.3 Offline knowledge base and wordlists
 
-- `kb/`：三个 git submodule（[vulhub](https://github.com/vulhub/vulhub) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) / [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)），clone 时加 `--recurse-submodules`；`kb/bin/nuclei` 超过 GitHub 单文件限制，需从 [Releases](https://github.com/projectdiscovery/nuclei/releases) 自行下载。`CRUISER_KB_DIR` 可覆盖路径。配合禁网规则，全部情报来源本地化；
-- `resource/`：`username.txt` / `password.txt` / `xss.txt` 字典与 `flag_hunting.txt`（flag 线索清单）。
-
----
-
-## 11. 配置体系
-
-### 11.1 命令行参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--target` | 无 | 扫描目标地址（未提供时由本地平台启动靶场获取） |
-| `--challenge-code` | 无 | 题目代码 |
-| `--sessions` | 1 | 并发工作会话数（≥2 进入分层调度） |
-| `--worker-models` | 无 | 各 worker 模型清单，覆盖 `--sessions`；`kimi-*` 自动路由 Kimi 端点 |
-| `--max-steps` | 0 | 引擎内强制步数上限（0 = 不强制，由调度器按阈值监控） |
-| `--hint` | 无 | 题目提示 |
-| `--quiet` | False | 静默中间输出，仅保留最终 JSON |
-| `--default-timeout` / `--max-timeout` | 0 | `run_command` 默认/上限超时秒数 |
-
-### 11.2 关键环境变量（完整清单见 README）
-
-| 分类 | 变量 | 说明 |
-|------|------|------|
-| 题目 | `CRUISER_CHALLENGES` | 题目定义 YAML 路径（默认项目根目录 `challenges.yaml`） |
-| 密钥 | `DEEPSEEK_API_KEY` / `KIMI_API_KEY` / `GLM_API_KEY` | 按模型名前缀自动选用 |
-| 模型 | `CRUISER_MODEL` / `ANTHROPIC_MODEL` / `WATCHER_MODEL` / `CRUISER_SOLVER_MODEL` | 解题 / watcher / solver 模型 |
-| 上下文 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS`（1M）/ `CLAUDE_CODE_AUTO_COMPACT_WINDOW`（800K） | 校正 auto-compact 触发时机 |
-| 调度 | `CRUISER_MAX_ACTIVE`（3）/ `CRUISER_CONTAINER_WARMUP`（60s） | 并发题目数 / 靶场就绪探测 |
-| 协作 | `CRUISER_TEMP_MIN/MAX`（0.0/0.9） | 多会话温度分片区间 |
-| watcher | `CRUISER_WATCHER_EVERY`（4）/ `CRUISER_WATCHER_RECENT`（48） | 策展频率与活动窗口 |
-| 运行台 | `CRUISER_DASHBOARD` / `CRUISER_DASHBOARD_HOST` / `CRUISER_DASHBOARD_PORT` | 默认 `127.0.0.1:8765`；`=0` 关闭 |
-| solver | `CRUISER_SOLVER_MAX_TURNS`（40）/ `CRUISER_MAX_SOLVERS`（3） | solver 回合与并发上限 |
-| 逆向 | `GHIDRA_INSTALL_DIR` / `JAVA_HOME` | PyGhidra 运行环境 |
-
-**密钥纪律**：所有凭证一律经环境变量（可写 `.env`，不覆盖已有环境变量），源码零硬编码；`.env` 不入库。
+- `kb/`: three git submodules ([vulhub](https://github.com/vulhub/vulhub) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) / [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)); clone with `--recurse-submodules`. `kb/bin/nuclei` exceeds GitHub's per-file limit, so download it yourself from [Releases](https://github.com/projectdiscovery/nuclei/releases). `CRUISER_KB_DIR` can override the path. Combined with the no-network rule, all intelligence sources are local;
+- `resource/`: the `username.txt` / `password.txt` / `xss.txt` wordlists and `flag_hunting.txt` (a checklist of flag locations).
 
 ---
 
-## 12. 并发安全与容错设计
+## 11. Configuration
 
-### 12.1 并发安全清单
+### 11.1 Command-line options
 
-| 场景 | 机制 |
-|------|------|
-| 黑板/任务板并发读写 | `fcntl.LOCK_EX` 文件锁包裹「读-改-写」全程；写回走临时文件 + `os.replace` 原子替换，读者永远看到完整文件 |
-| watcher 应用变更 vs 其他会话写入 | LLM 审阅用无锁快照，应用时锁内重读最新内容，按内容模糊匹配定位（规避行号漂移） |
-| 任务认领竞争 | 锁内「找到即擦除」，先到先得；`.claimed` 日志 45 分钟 TTL 参与判重并自动解冻 |
-| dirsearch 跨会话重复扫描 | 同一 URL 仅实扫一次，其余会话阻塞等待复用报告 |
-| 解题进度并发提交 | `_platform_state.json` 文件锁内读改写 + 按 flag 下标去重，多进程同时交同一 flag 只计一次 |
-| flag 重复提交 | 本地平台幂等（duplicate）+ flagstore 预检 + `verified` 集合去重 |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--target` | none | Target address to scan (when omitted, the local platform starts the target to get it) |
+| `--challenge-code` | none | Challenge code |
+| `--sessions` | 1 | Number of concurrent worker sessions (≥2 enables tiered scheduling) |
+| `--worker-models` | none | Per-worker model list, overrides `--sessions`; `kimi-*` is routed to the Kimi endpoint automatically |
+| `--max-steps` | 0 | Forced step limit inside the engine (0 = not forced; the scheduler monitors thresholds) |
+| `--hint` | none | Challenge hint |
+| `--quiet` | False | Silence intermediate output and keep only the final JSON |
+| `--default-timeout` / `--max-timeout` | 0 | Default/maximum `run_command` timeout in seconds |
 
-### 12.2 容错与恢复矩阵
+### 11.2 Key environment variables (full list in the README)
 
-| 故障 | 检测 | 恢复 |
-|------|------|------|
-| worker/claude 崩溃 | reader 线程读到 EOF / 进程退出码 | 该题本轮记 remaining，晋级或重试；其他题不受影响 |
-| 主进程退出（Ctrl+C/SIGTERM） | 信号处理器 + `atexit` | 整组 `killpg` 所有 worker 并 down 掉 `cruiser_*` compose 项目 |
-| 主进程异常死亡（SIGKILL） | 父进程已死 | `kill_orphans.py` 清理悬空 worker/claude 进程组 |
-| compose 靶场残留（主进程被 SIGKILL） | 下次启动 `docker compose ls` | `down_leftovers()` 关闭所有 `cruiser_*` 项目 |
-| LLM 端点不可用 | HTTP 异常 | watcher 降级静默跳过；worker 会话自然结束，下轮重试 |
-| watcher LLM 失败 | 异常吞没 | 不影响解题主流程；flag 兜底提交先于策展执行 |
-| 靶场慢启动 | warmup 探测超时（60s） | 放行交由 LLM 自行重试，防调度卡死 |
-| 题目解出 / 从定义文件删除 | 轮询对账 | `kill_flags[code].set()` 强杀对应会话组 |
-| 状态文件损坏 | JSON 解析失败 | 备份为 `.corrupt`，从空状态继续 |
-| 上下文逼近上限 | `AUTO_COMPACT_WINDOW`（800K） | claude CLI 自动压缩，留 200K 余量 |
+| Category | Variable | Description |
+|----------|----------|-------------|
+| Challenges | `CRUISER_CHALLENGES` | Path to the challenge definition YAML (default `challenges.yaml` in the project root) |
+| Keys | `DEEPSEEK_API_KEY` / `KIMI_API_KEY` / `GLM_API_KEY` | Chosen automatically by model-name prefix |
+| Models | `CRUISER_MODEL` / `ANTHROPIC_MODEL` / `WATCHER_MODEL` / `CRUISER_SOLVER_MODEL` | Solving / watcher / solver models |
+| Context | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (1M) / `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (800K) | Corrects when auto-compact triggers |
+| Scheduling | `CRUISER_MAX_ACTIVE` (3) / `CRUISER_CONTAINER_WARMUP` (60s) | Concurrent challenge count / target readiness probe |
+| Collaboration | `CRUISER_TEMP_MIN/MAX` (0.0/0.9) | Temperature range sharded across sessions |
+| Watcher | `CRUISER_WATCHER_EVERY` (4) / `CRUISER_WATCHER_RECENT` (48) | Curation frequency and activity window |
+| Dashboard | `CRUISER_DASHBOARD` / `CRUISER_DASHBOARD_HOST` / `CRUISER_DASHBOARD_PORT` | Default `127.0.0.1:8765`; `=0` turns it off |
+| Solver | `CRUISER_SOLVER_MAX_TURNS` (40) / `CRUISER_MAX_SOLVERS` (3) | Solver turn and concurrency limits |
+| Reversing | `GHIDRA_INSTALL_DIR` / `JAVA_HOME` | PyGhidra runtime |
 
----
-
-## 13. 可观测性
-
-调度主进程默认在 `http://127.0.0.1:8765` 拉起运行台（`cruiser/dashboard.py`），展示题目队列、黑板、任务板、flag 进度与 worker 日志。独立进程可用 `uv run python -m cruiser.dashboard`（只读 `reports/`）。`CRUISER_DASHBOARD=0` 关闭。
-
-系统同时通过结构化 stdout 标记输出，便于 `tee` 落盘与 `grep` 检索：
-
-| 标记 | 含义 |
-|------|------|
-| `[COUNT] N` | 跨会话单调递增的步数计数（调度阈值依据） |
-| `[TOOL] ...` / `[Claude] ...` | 工具调用与模型文本摘要 |
-| `[Watcher] 会话 X 维护黑板: 新增/修正/删除` | 黑板策展动作 |
-| `[Watcher] 会话 X 任务板: 发布/下架` | 任务板变更 |
-| `[Stage-Preprocess/Tier1/Tier2/Tier3]` | 层级调度事件 |
-| `[STAGE] 步数达到阈值 c/limit` | 本轮停止原因 |
-| `[FLAG RECOVERED]` | 会话结束后程序化补交成功 |
-| `[Container] ...` / `[Startup] 已关闭遗留靶场` | 靶场治理 |
-| `[Fetcher] 全部题目已解出，退出` | 调度器正常结束 |
-| `[{code}:S{idx}]` / `[{code}:SOLVER{sid}]` | 按题+会话前缀的 worker/solver 输出 |
+**Key discipline**: all credentials come from environment variables (they can be written to `.env`, which does not override existing variables); the source has zero hard-coded keys; `.env` is not tracked.
 
 ---
 
-## 14. 部署与运行
+## 12. Concurrency safety and fault tolerance
 
-### 14.1 环境要求
+### 12.1 Concurrency safety checklist
 
-- Python ≥ 3.11，[uv](https://docs.astral.sh/uv/) 包管理器；
-- **`claude` CLI 必须安装且在 PATH 中**（引擎依赖）；
-- 可选：Docker（含 compose 插件），仅 `compose:` 类型题目需要；
-- 可选：Ghidra + JDK（PyGhidra 逆向）。
+| Scenario | Mechanism |
+|----------|-----------|
+| Concurrent blackboard/task board reads and writes | An `fcntl.LOCK_EX` file lock wraps the whole read-modify-write; write-back goes through a temp file + atomic `os.replace`, so readers always see a complete file |
+| Watcher applying changes vs. writes from other sessions | The LLM review uses a lock-free snapshot; when applying, the latest content is re-read under the lock and entries are located by fuzzy content match (avoids line-number drift) |
+| Competing task claims | "Find and erase" under the lock, first come, first served; the `.claimed` log has a 45-minute TTL, takes part in deduplication, and unfreezes automatically |
+| Duplicate dirsearch scans across sessions | Each URL is scanned once; the other sessions block and reuse the report |
+| Concurrent progress submissions | Read-modify-write of `_platform_state.json` under the file lock + dedup by flag index, so the same flag submitted by several processes at once counts only once |
+| Duplicate flag submissions | Local platform idempotency (duplicate) + flagstore precheck + `verified` set dedup |
 
-### 14.2 安装与启动
+### 12.2 Fault tolerance and recovery matrix
+
+| Fault | Detection | Recovery |
+|-------|-----------|----------|
+| worker/claude crash | Reader thread hits EOF / process exit code | The challenge is recorded as remaining for this round and promoted or retried; other challenges are unaffected |
+| Main process exit (Ctrl+C/SIGTERM) | Signal handlers + `atexit` | `killpg` every worker as a group and bring down the `cruiser_*` compose projects |
+| Main process dies abnormally (SIGKILL) | Parent process is dead | `kill_orphans.py` cleans up dangling worker/claude process groups |
+| Leftover compose targets (main process was SIGKILLed) | `docker compose ls` at next startup | `down_leftovers()` shuts down all `cruiser_*` projects |
+| LLM endpoint unavailable | HTTP exception | The watcher degrades and skips silently; the worker session ends naturally and is retried next round |
+| Watcher LLM failure | Exception swallowed | Does not affect the main solving flow; fallback flag submission runs before curation |
+| Slow target start | Warmup probe timeout (60s) | Sessions start anyway and the LLM retries on its own, so scheduling does not hang |
+| Challenge solved / removed from the definition file | Polling reconciliation | `kill_flags[code].set()` force-kills the corresponding session group |
+| Corrupted state file | JSON parse failure | Backed up as `.corrupt`, continue from an empty state |
+| Context nearing the limit | `AUTO_COMPACT_WINDOW` (800K) | The claude CLI compacts automatically, leaving 200K headroom |
+
+---
+
+## 13. Observability
+
+By default the scheduler main process serves a dashboard (`cruiser/dashboard.py`) at `http://127.0.0.1:8765`, showing the challenge queue, blackboard, task board, flag progress, and worker logs. To run it as a separate process, use `uv run python -m cruiser.dashboard` (it only reads `reports/`). `CRUISER_DASHBOARD=0` turns it off.
+
+The system also emits structured stdout markers, which are easy to save with `tee` and search with `grep`:
+
+| Marker | Meaning |
+|--------|---------|
+| `[COUNT] N` | Step count increasing monotonically across sessions (the basis for scheduling thresholds) |
+| `[TOOL] ...` / `[Claude] ...` | Summaries of tool calls and model text |
+| `[Watcher] session X blackboard: added/updated/removed` | Blackboard curation actions |
+| `[Watcher] session X task board: published/retired` | Task board changes |
+| `[Stage-Preprocess/Tier1/Tier2/Tier3]` | Tiered scheduling events |
+| `[STAGE] step threshold reached c/limit, ending this round` | Why this round stopped |
+| `[FLAG RECOVERED]` | Programmatic resubmission after the session ended succeeded |
+| `[Container] ...` / `[Startup] shut down leftover targets` | Target management |
+| `[Fetcher] all challenges solved, exiting` | The scheduler finished normally |
+| `[{code}:S{idx}]` / `[{code}:SOLVER{sid}]` | Worker/solver output prefixed by challenge + session |
+
+---
+
+## 14. Deployment and operation
+
+### 14.1 Requirements
+
+- Python ≥ 3.11 and the [uv](https://docs.astral.sh/uv/) package manager;
+- **The `claude` CLI must be installed and on PATH** (the engine depends on it);
+- Optional: Docker (with the compose plugin), only needed for `compose:` challenges;
+- Optional: Ghidra + JDK (PyGhidra reverse engineering).
+
+### 14.2 Installation and startup
 
 ```bash
-# 克隆（含 kb/ 三个 submodule）与依赖
+# Clone (including the three kb/ submodules) and install dependencies
 git clone --recurse-submodules https://github.com/TJR181/Cruiser-Agent.git
 cd Cruiser-Agent
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
-# 配置凭证（.env 或环境变量）与题目定义
-export DEEPSEEK_API_KEY=<DeepSeek 密钥>
-cp challenges.example.yaml challenges.yaml   # 按需编辑；或 export CRUISER_CHALLENGES=/path/to/xxx.yaml
+# Configure credentials (.env or environment variables) and challenge definitions
+export DEEPSEEK_API_KEY=<DeepSeek key>
+cp challenges.example.yaml challenges.yaml   # Edit as needed; or export CRUISER_CHALLENGES=/path/to/xxx.yaml
 
-# 自动模式：按题目定义分层调度，全部解出后退出（推荐）
+# Automatic mode: tiered scheduling from the challenge definitions, exits once everything is solved (recommended)
 uv run python main.py --sessions 5
 
-# 多模型混编
+# Mixed models
 uv run python main.py --worker-models deepseek-v4-flash,deepseek-v4-flash,kimi-k3
 
-# 指定单目标
-uv run python main.py --target http://<IP:端口> --challenge-code <CODE>
+# Single target
+uv run python main.py --target http://<IP:port> --challenge-code <CODE>
 
-# 查看/清空解题进度（重跑前）
+# Show/clear solving progress (before a rerun)
 uv run python -m cruiser.challenges list
 uv run python -m cruiser.challenges reset
 
-# 运行测试（stub claude，无需密钥/Docker/网络）
+# Run tests (stub claude, no key/Docker/network needed)
 uv run pytest
 
-# 浏览器打开运行台（主进程已拉起时）
+# Open the dashboard in a browser (once the main process has started it)
 # http://127.0.0.1:8765
 ```
 
-> 离线部署说明：`uv sync` 只装核心依赖，解题中 Agent 还会按需临时加装 Python 包（`web3`/`slither`/`angr` 等）。离线镜像直接整份分发已就绪的 `.venv`，而非在目标环境重新 sync。
+> Offline deployment: `uv sync` installs only the core dependencies, and while solving the agent may install Python packages on demand (`web3`/`slither`/`angr`, etc.). Offline images ship a ready-made `.venv` as a whole instead of re-running sync in the target environment.
 
 ---
 
-## 15. 性能调优建议
+## 15. Performance tuning
 
-| 目标 | 手段 |
-|------|------|
-| 提高单位时间解题数 | 调大 `--sessions`（受本机资源与 LLM 配额约束）；按机器能力调整 `CRUISER_MAX_ACTIVE` |
-| 提高难题成功率 | 提高三级阈值；`--worker-models` 混入更强模型（如 1 个 `deepseek-v4-pro` 带 2 个 flash）；确认 watcher 用 pro 级模型 |
-| 降低 token 成本 | 主力用 flash 级模型；黑板/任务板注入已有 3000 字符截断；`--quiet` 减少日志 I/O |
-| 减少重复劳动 | 保持黑板注入开启；dirsearch 去重勿绕过；合理温度分片（默认 0.0~0.9）保证视角差异 |
-| 缩短靶场空转 | warmup 探测保持默认 60s；compose 题目尽量精简镜像、加快服务启动 |
-
----
-
-## 16. 风险与限制
-
-1. **强依赖 `claude` CLI**：引擎构建在其 stream-json 协议与钩子机制上，CLI 版本升级需回归验证。
-2. **本机资源约束**：compose 靶场与多会话 worker 都跑在本机，`CRUISER_MAX_ACTIVE` 过大会导致资源争用；compose 题目的 `addresses` 端口需自行避免冲突。
-3. **提示策略**：三级起才下发提示，属设计取舍（先黑盒、再借助提示）；不希望 Agent 看到提示时不写 `hint` 即可。
-4. **黑盒定位**：当前流程全程黑盒（无源码审计通道）；对需源码辅助的题目依赖 Agent 自行从靶场读源码（文件包含/命令执行后优先读源码已写入提示词）。
-5. **watcher 成本**：默认每 4 步一次 pro 级模型调用，token 开销随会话数线性增长（可用 `CRUISER_WATCHER_EVERY` 调稀）。
-6. **文件总线规模**：单题黑板依赖 watcher 策展控制体量；极端长会话下黑板仍可能膨胀，注入端以尾部 3000 字符截断兜底。
+| Goal | Approach |
+|------|----------|
+| More challenges solved per unit time | Raise `--sessions` (bounded by local resources and LLM quota); tune `CRUISER_MAX_ACTIVE` to the machine |
+| Higher success rate on hard challenges | Raise the tier 3 threshold; mix stronger models in with `--worker-models` (such as 1 × `deepseek-v4-pro` with 2 × flash); make sure the watcher uses a pro-class model |
+| Lower token cost | Use flash-class models for the main workers; blackboard/task board injection already truncates at 3000 characters; `--quiet` reduces log I/O |
+| Less duplicate work | Keep blackboard injection on; do not bypass dirsearch dedup; use sensible temperature sharding (default 0.0~0.9) to keep viewpoints different |
+| Less idle target time | Keep the warmup probe at the default 60s; keep compose challenge images lean and services quick to start |
 
 ---
 
-## 17. 演进方向
+## 16. Risks and limitations
 
-| 方向 | 说明 |
-|------|------|
-| 解题画像学习 | 统计各题型的层级分布与耗时，动态调整阈值与模型搭配 |
-| 黑板结构化升级 | 从自由文本演进为「端点/凭证/漏洞/结论」分类条目，支持按类检索注入 |
-| solver 策略强化 | 根据任务板认领完成率动态扩缩 solver 数；引入方向优先级 |
-| 多题知识迁移 | 跨题目沉淀可复用利用模式（当前知识库为静态离线 PoC） |
-| 恢复点能力 | 会话中断后基于黑板 + 活动摘要续跑，而非从零开始 |
-| 评测报表 | 运行台已覆盖实时队列/黑板/日志；可再汇总每题步数与 token 消耗 |
+1. **Hard dependency on the `claude` CLI**: the engine is built on its stream-json protocol and hook mechanism, so CLI upgrades need regression testing.
+2. **Local resource limits**: compose targets and multi-session workers all run on the local machine, so setting `CRUISER_MAX_ACTIVE` too high causes resource contention; you must avoid port conflicts in compose challenges' `addresses` yourself.
+3. **Hint policy**: giving hints only from tier 3 onward is a deliberate trade-off (black-box first, then hints); if you never want the agent to see a hint, just leave `hint` out.
+4. **Black-box only**: the current flow is black-box throughout (no source-audit channel); challenges that need source help rely on the agent reading source from the target itself (the prompt already says to read source first after file inclusion/command execution).
+5. **Watcher cost**: by default one pro-class model call every 4 steps, so token cost grows linearly with the number of sessions (thin it out with `CRUISER_WATCHER_EVERY`).
+6. **File bus scale**: each challenge's blackboard relies on watcher curation to stay small; in extremely long sessions it can still grow, and the injection side's last-3000-character truncation is the fallback.
 
 ---
 
-## 18. 附录
+## 17. Future directions
 
-### 18.1 关键源文件索引
-
-| 文件 | 职责 |
-|------|------|
-| `main.py` | CLI 入口、靶场治理、分层调度主循环、worker/solver 生命周期、运行台 |
-| `cruiser/challenges.py` | 本地题目平台：YAML 解析校验、靶场启停、flag 校验、跨进程进度、命令行 |
-| `cruiser/claude_agent.py` | claude CLI 驱动、stream-json 解析、watcher 策展、flag 权威校验、`[flag方法]` 写入 |
-| `cruiser/dashboard.py` | 运行台 HTTP 服务 |
-| `cruiser/runtime.py` | 调度器运行态快照与 `reports/` 汇编 |
-| `cruiser/llm.py` | LLM 提供方注册表、模型路由、温度分片 |
-| `cruiser/taskboard.py` | 任务板发布/认领/回报/下架（文件锁 + 原子重写 + 相似度判重） |
-| `cruiser/prompt.py` | 系统提示词与任务模板（探索 / solver 两套） |
-| `cruiser/tools.py` | submit_flag、dirsearch、XSS fuzz 等工具实现 |
-| `blackboard_hook.py` | SessionStart / PostToolUse 上下文硬注入钩子 |
-| `kill_orphans.py` | 悬空进程清理兜底 |
-| `challenges.example.yaml` / `examples/web-demo/` | 题目定义示例与演示靶场 |
-| `tests/` | pytest 测试（含 stub claude 的调度器冒烟测试） |
-
-### 18.2 运行时文件布局（`reports/`）
-
-| 文件 | 内容 | 写者 | 读者 |
-|------|------|------|------|
-| `info_<code>.txt` | 共享黑板 | 各会话 / watcher / 任务回报 | 钩子注入、watcher |
-| `tasks_<code>.txt` | 待认领探索方向 | watcher | worker / solver |
-| `tasks_<code>.txt.claimed` | 认领日志（45min TTL） | claim_task | publish 判重、watcher |
-| `hint_<code>.txt` | 题目提示 | 主进程（三级拉取） | 钩子注入、watcher |
-| `desc_<code>.txt` | 题目描述 | 主进程 | 钩子注入、watcher |
-| `_runtime.json` | 调度器运行态快照 | 主进程 | 运行台（独立进程模式） |
-| `_flagstore.json` | 跨进程正确/错误 flag 记忆 | submit_flag | 提交预检、前缀学习 |
-| `_platform_state.json` | 本地平台解题进度（每题已交对的 flag 下标） | 本地平台 `submit` | 调度器对账、提交回执进度、`python -m cruiser.challenges list` |
+| Direction | Description |
+|-----------|-------------|
+| Learning solve profiles | Collect tier distribution and time spent per challenge type, and adjust thresholds and model mixes dynamically |
+| Structured blackboard | Evolve from free text into categorized "endpoint/credential/vulnerability/conclusion" entries, with injection filtered by category |
+| Stronger solver strategy | Scale the number of solvers by task board claim/completion rate; add direction priorities |
+| Cross-challenge knowledge transfer | Capture reusable exploitation patterns across challenges (the current knowledge base is static offline PoCs) |
+| Checkpointing | Resume an interrupted session from the blackboard + activity summary instead of starting from scratch |
+| Evaluation reports | The dashboard already covers live queues/blackboard/logs; per-challenge step and token usage could be summarized too |
 
 ---
 
-*本文档与代码同步维护；机制性变更请同步修订对应章节。*
+## 18. Appendix
+
+### 18.1 Key source file index
+
+| File | Responsibility |
+|------|----------------|
+| `main.py` | CLI entry, target management, tiered scheduling main loop, worker/solver lifecycle, dashboard |
+| `cruiser/challenges.py` | Local challenge platform: YAML parsing/validation, target start/stop, flag verification, cross-process progress, CLI |
+| `cruiser/claude_agent.py` | claude CLI driver, stream-json parsing, watcher curation, authoritative flag verification, writing `[flag-method]` |
+| `cruiser/dashboard.py` | Dashboard HTTP service |
+| `cruiser/runtime.py` | Scheduler runtime snapshot and `reports/` assembly |
+| `cruiser/llm.py` | LLM provider registry, model routing, temperature sharding |
+| `cruiser/taskboard.py` | Task board publish/claim/report/retire (file lock + atomic rewrite + similarity dedup) |
+| `cruiser/prompt.py` | System prompts and task templates (two sets: exploration / solver) |
+| `cruiser/tools.py` | Implementations of submit_flag, dirsearch, XSS fuzz and other tools |
+| `blackboard_hook.py` | SessionStart / PostToolUse hard context injection hooks |
+| `kill_orphans.py` | Fallback cleanup for dangling processes |
+| `challenges.example.yaml` / `examples/web-demo/` | Example challenge definitions and demo target |
+| `tests/` | pytest tests (including the scheduler smoke test with a stub claude) |
+
+### 18.2 Runtime file layout (`reports/`)
+
+| File | Contents | Writers | Readers |
+|------|----------|---------|---------|
+| `info_<code>.txt` | Shared blackboard | Sessions / watcher / task results | Hook injection, watcher |
+| `tasks_<code>.txt` | Exploration directions waiting to be claimed | Watcher | Worker / solver |
+| `tasks_<code>.txt.claimed` | Claim log (45min TTL) | claim_task | publish dedup, watcher |
+| `hint_<code>.txt` | Challenge hint | Main process (fetched at tier 3) | Hook injection, watcher |
+| `desc_<code>.txt` | Challenge description | Main process | Hook injection, watcher |
+| `_runtime.json` | Scheduler runtime snapshot | Main process | Dashboard (standalone process mode) |
+| `_flagstore.json` | Cross-process memory of correct/wrong flags | submit_flag | Submission precheck, prefix learning |
+| `_platform_state.json` | Local platform solving progress (indexes of accepted flags per challenge) | Local platform `submit` | Scheduler reconciliation, progress in submission receipts, `python -m cruiser.challenges list` |
+
+---
+
+*This document is maintained alongside the code; please update the matching sections when mechanisms change.*

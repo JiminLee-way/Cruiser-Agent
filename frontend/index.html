@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cruiser 运行台</title>
+  <title>Cruiser Console</title>
   <link rel="stylesheet" href="/console.css">
 </head>
 <body>
@@ -12,12 +12,12 @@
       <span class="mark" aria-hidden="true"></span>
       <div>
         <strong>Cruiser</strong>
-        <span class="sub">运行台</span>
+        <span class="sub">Console</span>
       </div>
     </div>
     <div class="vitals" id="vitals"></div>
     <div class="top-right">
-      <span class="pulse" id="pulse" data-alive="0">离线</span>
+      <span class="pulse" id="pulse" data-alive="0">Offline</span>
       <span class="clock" id="clock"></span>
     </div>
   </header>
@@ -25,14 +25,14 @@
   <div class="shell">
     <aside class="rail">
       <div class="rail-head">
-        <span>题目</span>
-        <input id="filterCode" type="search" placeholder="筛选代码" autocomplete="off">
+        <span>Challenges</span>
+        <input id="filterCode" type="search" placeholder="Filter code" autocomplete="off">
       </div>
       <nav id="challengeList" class="challenge-list"></nav>
     </aside>
 
     <main class="stage" id="stage">
-      <div class="empty" id="emptyState">等待 reports/ 或调度器心跳。</div>
+      <div class="empty" id="emptyState">Waiting for reports/ or a scheduler heartbeat.</div>
       <section class="detail hidden" id="detail">
         <div class="detail-head">
           <div>
@@ -46,22 +46,22 @@
         </div>
         <p class="desc" id="dDesc"></p>
         <p class="target" id="dTarget"></p>
-        <details class="hint-box hidden" id="dHintBox"><summary>题目提示</summary><pre id="dHint"></pre></details>
+        <details class="hint-box hidden" id="dHintBox"><summary>Challenge hint</summary><pre id="dHint"></pre></details>
 
         <div class="grid">
           <section class="panel" id="panelWorkers">
-            <header><h2>会话</h2><span class="count" id="nWorkers">0</span></header>
+            <header><h2>Sessions</h2><span class="count" id="nWorkers">0</span></header>
             <div class="body" id="workers"></div>
           </section>
           <section class="panel" id="panelTasks">
-            <header><h2>任务板</h2><span class="count" id="nTasks">0</span></header>
+            <header><h2>Task board</h2><span class="count" id="nTasks">0</span></header>
             <div class="body" id="tasks"></div>
           </section>
           <section class="panel span-2" id="panelBoard">
             <header>
-              <h2>黑板</h2>
+              <h2>Blackboard</h2>
               <span class="count" id="nBoard">0</span>
-              <label class="toggle"><input type="checkbox" id="onlyMethods">只看 flag 方法</label>
+              <label class="toggle"><input type="checkbox" id="onlyMethods">Flag methods only</label>
             </header>
             <div class="body" id="board"></div>
           </section>
@@ -69,11 +69,11 @@
             <header><h2>Flag</h2><span class="count" id="nFlags">0</span></header>
             <div class="body flags-split">
               <div>
-                <h3>平台确认正确</h3>
+                <h3>Confirmed by platform</h3>
                 <ul id="flagsOk"></ul>
               </div>
               <div>
-                <h3>已拒绝</h3>
+                <h3>Rejected</h3>
                 <ul id="flagsBad"></ul>
               </div>
             </div>
@@ -82,10 +82,10 @@
 
         <section class="log-panel">
           <header>
-            <h2>实时日志</h2>
-            <input id="logFilter" type="search" placeholder="过滤 TOOL / Claude / Watcher…" autocomplete="off">
-            <label class="toggle"><input type="checkbox" id="logStick" checked>跟随</label>
-            <button type="button" id="logClear">清空视图</button>
+            <h2>Live log</h2>
+            <input id="logFilter" type="search" placeholder="Filter TOOL / Claude / Watcher…" autocomplete="off">
+            <label class="toggle"><input type="checkbox" id="logStick" checked>Follow</label>
+            <button type="button" id="logClear">Clear view</button>
           </header>
           <pre id="logView" class="log-view"></pre>
         </section>

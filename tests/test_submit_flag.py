@@ -32,13 +32,13 @@ def tools(write_yaml, platform_env):
 def test_outcome_multi_flag_progress(tools):
     out = tools.submit_flag_outcome("WEB-1", "flag{first_of_two}")
     assert (out.ok, out.fresh, out.definitive, out.correct, out.total) == (True, True, True, 1, 2)
-    assert "提交flag正确" in out.output and "flag 进度 1/2" in out.output
-    assert "本题还有 1 个 flag 未提交" in out.output
+    assert "FLAG CORRECT" in out.output and "flag progress 1/2" in out.output
+    assert "This challenge still has 1 flag(s) not submitted" in out.output
     assert not tools.flags_all_collected(out.correct, out.total)
 
     out = tools.submit_flag_outcome("WEB-1", "flag{second_of_two}")
     assert (out.ok, out.fresh, out.correct, out.total) == (True, True, 2, 2)
-    assert "flag 进度 2/2" in out.output and "未提交" not in out.output
+    assert "flag progress 2/2" in out.output and "not submitted" not in out.output
     assert tools.flags_all_collected(out.correct, out.total)
     assert tools.query_flag_progress("WEB-1") == (2, 2)
 
@@ -47,35 +47,35 @@ def test_outcome_duplicate_and_wrong(tools):
     tools.submit_flag_outcome("WEB-1", "flag{first_of_two}")
     dup = tools.submit_flag_outcome("WEB-1", "flag{first_of_two}")
     assert (dup.ok, dup.fresh, dup.correct, dup.total) == (True, False, 1, 2)
-    assert "已经提交成功过了" in dup.output and "flag 进度 1/2" in dup.output
+    assert "ALREADY SUBMITTED" in dup.output and "flag progress 1/2" in dup.output
 
     wrong = tools.submit_flag_outcome("WEB-1", "flag{definitely_wrong}")
-    assert (wrong.ok, wrong.definitive) == (False, True) and "flag 错误" in wrong.output
+    assert (wrong.ok, wrong.definitive) == (False, True) and "wrong flag" in wrong.output
     again = tools.submit_flag_outcome("WEB-1", "flag{definitely_wrong}")
-    assert not again.ok and "已知的错误 flag" in again.output
+    assert not again.ok and "a known wrong flag" in again.output
 
-    # 交对的 flag 拿去别的题：flagstore 直接拒绝
+    # an accepted flag submitted for another challenge: the flagstore rejects it outright
     cross = tools.submit_flag_outcome("WEB-2", "flag{first_of_two}")
-    assert not cross.ok and "其他题目" in cross.output
+    assert not cross.ok and "another challenge" in cross.output
 
 
 def test_outcome_duplicate_when_flagstore_missed_it(tools, tmp_path):
-    """平台已记对但本地 flagstore 没有（如 flagstore 被清空）：走平台 duplicate 分支。"""
+    """The platform has it recorded as correct but the local flagstore does not (e.g. the flagstore was cleared): takes the platform duplicate branch."""
     import cruiser.challenges as challenges
     challenges.get_platform().submit("WEB-2", "flag{single_flag_x}")
     out = tools.submit_flag_outcome("WEB-2", "flag{single_flag_x}")
     assert (out.ok, out.fresh, out.correct, out.total) == (True, False, 1, 1)
-    assert "已经提交成功过了" in out.output
+    assert "ALREADY SUBMITTED" in out.output
 
 
 def test_outcome_unknown_challenge(tools):
     out = tools.submit_flag_outcome("NOPE-1", "flag{whatever_value}")
-    assert (out.ok, out.definitive) == (False, True) and "未知题目" in out.output
+    assert (out.ok, out.definitive) == (False, True) and "unknown challenge" in out.output
 
 
 def test_langchain_tool_wrapper(tools):
     text = tools.submit_flag.invoke({"challenge_code": "WEB-2", "flag": "flag{single_flag_x}"})
-    assert "提交flag正确" in text and "flag 进度 1/1" in text
+    assert "FLAG CORRECT" in text and "flag progress 1/1" in text
 
 
 def test_progress_text_is_parsed_by_agent(tools):
@@ -88,7 +88,7 @@ def test_progress_text_is_parsed_by_agent(tools):
 def _run_cli(repo, yaml_path, code, flag):
     proc = subprocess.run(
         [sys.executable, str(repo / "tools" / "submit_flag.py"), code, flag],
-        cwd=str(repo.parent),  # Agent 在工作空间里调用：cwd 不是项目根目录
+        cwd=str(repo.parent),  # the Agent calls it from its workspace: cwd is not the project root
         env=subprocess_env(CRUISER_CHALLENGES=str(yaml_path)),
         capture_output=True, text=True, timeout=120,
     )
@@ -98,13 +98,13 @@ def _run_cli(repo, yaml_path, code, flag):
 
 def test_submit_flag_cli_end_to_end(repo_copy, write_yaml):
     yaml_path = write_yaml(YAML)
-    assert "提交的 flag 错误" in _run_cli(repo_copy, yaml_path, "WEB-1", "flag{nope_nope_nope}")
+    assert "wrong flag" in _run_cli(repo_copy, yaml_path, "WEB-1", "flag{nope_nope_nope}")
     out = _run_cli(repo_copy, yaml_path, "WEB-1", "flag{first_of_two}")
-    assert "提交flag正确" in out and "flag 进度 1/2" in out
+    assert "FLAG CORRECT" in out and "flag progress 1/2" in out
     out = _run_cli(repo_copy, yaml_path, "WEB-1", "flag{first_of_two}")
-    assert "已经提交成功过了" in out and "flag 进度 1/2" in out
+    assert "ALREADY SUBMITTED" in out and "flag progress 1/2" in out
     out = _run_cli(repo_copy, yaml_path, "WEB-1", "flag{second_of_two}")
-    assert "提交flag正确" in out and "flag 进度 2/2" in out
+    assert "FLAG CORRECT" in out and "flag progress 2/2" in out
 
     state = json.loads((repo_copy / "reports" / "_platform_state.json").read_text())
     assert state["challenges"]["WEB-1"]["solved"] == [0, 1]

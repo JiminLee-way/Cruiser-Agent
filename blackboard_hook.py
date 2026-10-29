@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Claude Code 钩子：把题目描述/提示/共享黑板硬性注入会话上下文（不依赖模型自觉读取）。
+"""Claude Code hook: force-inject the challenge description/hint/shared blackboard into the session context (without relying on the model to read them on its own).
 
-- SessionStart：会话开始时注入一次题目描述 + 题目提示 + 当前黑板（各若非空）
-- PostToolUse：按工具调用计数，每 10 次注入一次最新内容（约等于每 10 步）
+- SessionStart: at session start, inject the challenge description + challenge hint + solving-state digest and latest ledger entries once (each if non-empty)
+- PostToolUse: count tool calls and inject the latest content every 10 calls (roughly every 10 steps)
 
-题目代码从环境变量 CRUISER_CHALLENGE_CODE 获取（worker/solver 进程已注入）。
-输出 hookSpecificOutput.additionalContext；无内容可注入时不输出任何东西。
+The challenge code comes from the CRUISER_CHALLENGE_CODE environment variable (already injected into worker/solver processes).
+Outputs hookSpecificOutput.additionalContext; outputs nothing when there is nothing to inject.
 """
 from __future__ import annotations
 
@@ -36,23 +36,11 @@ def main() -> int:
 
     root = os.path.dirname(os.path.abspath(__file__))
     reports = os.path.join(root, "reports")
-    desc_path = os.path.join(reports, f"desc_{code}.txt")
-    hint_path = os.path.join(reports, f"hint_{code}.txt")
-    info_path = os.path.join(reports, f"info_{code}.txt")
-
     def build_context() -> str:
-        """组装注入内容：题目描述 + 题目提示 + 共享黑板（均为空则不注入）。"""
-        parts = []
-        desc = _read_text(desc_path)
-        if desc:
-            parts.append(f"【题目描述】\n{desc[:_MAX_INJECT_CHARS]}")
-        hint = _read_text(hint_path)
-        if hint:
-            parts.append(f"【题目提示（已按比例扣分获取，请充分利用）】\n{hint[:_MAX_INJECT_CHARS]}")
-        bb = _read_text(info_path)
-        if bb:
-            parts.append(f"【共享黑板当前内容】\n{bb[-_MAX_INJECT_CHARS:]}")
-        return "\n\n".join(parts)
+        """Assemble the injected content: challenge description + challenge hint + solving-state digest and latest ledger entries (nothing is injected if all are empty)."""
+        sys.path.insert(0, root)
+        from cruiser.opencode_engine import context_block
+        return context_block(reports, code)
 
     def emit(ctx: str) -> None:
         print(json.dumps(
@@ -66,7 +54,7 @@ def main() -> int:
             emit(ctx)
         return 0
 
-    # PostToolUse：每 10 次工具调用注入一次
+    # PostToolUse: inject once every 10 tool calls
     session = payload.get("session_id") or "unknown"
     counter_path = f"/tmp/cruiser_bbhook_{session}.count"
     try:
@@ -82,7 +70,7 @@ def main() -> int:
     if n % 10 == 0:
         ctx = build_context()
         if ctx:
-            emit(f"（以下内容每 10 步自动注入，请关注并利用其他会话的新发现）\n{ctx}")
+            emit(f"(The following is injected automatically every 10 steps; pay attention to and use new findings from other sessions)\n{ctx}")
     return 0
 
 

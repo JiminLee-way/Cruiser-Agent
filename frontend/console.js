@@ -44,16 +44,16 @@
       .map((k) => (q[k]?.waiting || []).length)
       .reduce((a, b) => a + b, 0);
     $("vitals").innerHTML = [
-      ["在飞", `${snap.inflight || 0}/${snap.max_active || "–"}`],
-      ["运行中", snap.running || 0],
-      ["排队", wait],
-      ["已解", snap.solved_n || 0],
-      ["正确 flag", snap.flags_ok || 0],
+      ["In flight", `${snap.inflight || 0}/${snap.max_active || "–"}`],
+      ["Running", snap.running || 0],
+      ["Queued", wait],
+      ["Solved", snap.solved_n || 0],
+      ["Correct flags", snap.flags_ok || 0],
     ]
       .map(([k, v]) => `<span class="vital">${k}<b>${v}</b></span>`)
       .join("");
     $("pulse").dataset.alive = snap.alive ? "1" : "0";
-    $("pulse").textContent = snap.alive ? "调度中" : "无调度心跳";
+    $("pulse").textContent = snap.alive ? "Scheduling" : "No scheduler heartbeat";
     $("clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   }
 
@@ -83,13 +83,13 @@
     ];
     $("nWorkers").textContent = String(rows.filter((w) => w.alive).length);
     if (!rows.length) {
-      $("workers").innerHTML = `<div class="row dead"><span>无活动会话</span></div>`;
+      $("workers").innerHTML = `<div class="row dead"><span>No active sessions</span></div>`;
       return;
     }
     $("workers").innerHTML = rows
       .map((w) => `<div class="row ${w.alive ? "" : "dead"}">
         <span>${esc(w.label)}</span>
-        <span>${esc(w.model || w.kind || "")} · ${w.count || 0} 步</span>
+        <span>${esc(w.model || w.kind || "")} · ${w.count || 0} steps</span>
         <span class="pid">${w.pid ? "pid " + w.pid : ""}</span>
         ${w.task ? `<span class="task">${esc(w.task)}</span>` : ""}
       </div>`)
@@ -99,12 +99,12 @@
   function taskRows(detail) {
     const pending = detail.pending_tasks || [];
     const claimed = detail.claimed_tasks || [];
-    $("nTasks").textContent = `${pending.length} 待领 / ${claimed.length} 执行中`;
+    $("nTasks").textContent = `${pending.length} pending / ${claimed.length} in progress`;
     const blocks = [];
     if (pending.length) {
       blocks.push(
         pending
-          .map((t) => `<div class="bb"><div class="who">${esc(t.id)} · 待认领</div>${esc(t.text)}</div>`)
+          .map((t) => `<div class="bb"><div class="who">${esc(t.id)} · unclaimed</div>${esc(t.text)}</div>`)
           .join(""),
       );
     }
@@ -118,7 +118,7 @@
           .join(""),
       );
     }
-    $("tasks").innerHTML = blocks.join("") || `<div class="bb"><div class="who">空</div>任务板暂无方向</div>`;
+    $("tasks").innerHTML = blocks.join("") || `<div class="bb"><div class="who">empty</div>No directions on the task board yet</div>`;
   }
 
   function boardRows(detail) {
@@ -130,21 +130,21 @@
       entries
         .map(
           (e) =>
-            `<article class="bb" data-kind="${esc(e.kind)}"><div class="who">${esc(e.ts)} · 会话 ${esc(e.worker)}</div>${esc(e.info)}</article>`,
+            `<article class="bb" data-kind="${esc(e.kind)}"><div class="who">${esc(e.ts)} · session ${esc(e.worker)}</div>${esc(e.info)}</article>`,
         )
-        .join("") || `<div class="bb"><div class="who">空</div>尚无黑板条目</div>`;
+        .join("") || `<div class="bb"><div class="who">empty</div>No blackboard entries yet</div>`;
   }
 
   function flagRows(detail) {
     const ok = detail.correct_flags || [];
     const bad = detail.wrong_flags || [];
-    $("nFlags").textContent = `${ok.length} 正确 / ${bad.length} 拒绝`;
+    $("nFlags").textContent = `${ok.length} correct / ${bad.length} rejected`;
     $("flagsOk").innerHTML = ok.length
       ? ok.map((x) => `<li>${esc(x.flag)}</li>`).join("")
-      : "<li>无</li>";
+      : "<li>none</li>";
     $("flagsBad").innerHTML = bad.length
       ? bad.map((f) => `<li>${esc(f)}</li>`).join("")
-      : "<li>无</li>";
+      : "<li>none</li>";
   }
 
   function renderDetail(detail) {
@@ -155,12 +155,12 @@
       detail.stage_label,
       detail.difficulty,
       detail.container_status,
-      detail.hint_ready ? "已取提示" : "",
+      detail.hint_ready ? "hint fetched" : "",
       detail.winner || "",
     ].filter(Boolean);
     $("dMeta").textContent = bits.join(" · ");
-    $("dDesc").textContent = detail.description || "无题目描述";
-    $("dTarget").textContent = detail.target || "目标未启动";
+    $("dDesc").textContent = detail.description || "No challenge description";
+    $("dTarget").textContent = detail.target || "Target not started";
     if (detail.hint) {
       $("dHintBox").classList.remove("hidden");
       $("dHint").textContent = detail.hint;
@@ -171,7 +171,7 @@
     const max = detail.max_count || 0;
     const lim = detail.threshold || 0;
     $("dProgressLabel").textContent = lim
-      ? `步数 ${max} / ${lim}（本轮阈值） · flag ${detail.flag_correct}/${detail.flag_total || "?"}`
+      ? `Steps ${max} / ${lim} (this round's threshold) · flag ${detail.flag_correct}/${detail.flag_total || "?"}`
       : `flag ${detail.flag_correct}/${detail.flag_total || "?"}`;
     $("dBar").style.width = `${pct(max, lim)}%`;
     workerRows(detail);
@@ -261,7 +261,7 @@
   });
 
   tick().catch((err) => {
-    $("emptyState").textContent = `无法连接监控接口：${err}`;
+    $("emptyState").textContent = `Cannot reach the monitoring API: ${err}`;
   });
   setInterval(() => tick().catch(() => {}), 1000);
 })();

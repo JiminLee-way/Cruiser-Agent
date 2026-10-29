@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""命令行提交 flag（供 Claude Code 引擎在解题过程中调用）。
+"""Submit a flag from the command line (called by the Claude Code engine while solving).
 
-用法:
+Usage:
     python tools/submit_flag.py <challenge_code> <flag>
 
-输出与 cruiser.tools.submit_flag 工具一致，包含本地题目平台的确认标记：
-- 「提交flag正确」/「已经提交成功过了」表示平台确认成功
-- 其他输出表示失败或错误
+The output matches the cruiser.tools.submit_flag tool and includes the local challenge platform's confirmation marker:
+- "FLAG CORRECT" / "ALREADY SUBMITTED" mean the platform confirmed success
+- any other output means failure or an error
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from cruiser.tools import submit_flag as _submit_flag_tool
 
 def main() -> int:
     if len(sys.argv) < 3:
-        print("用法: python tools/submit_flag.py <challenge_code> <flag>")
+        print("Usage: python tools/submit_flag.py <challenge_code> <flag>")
         return 2
     challenge_code = sys.argv[1]
     flag = sys.argv[2]

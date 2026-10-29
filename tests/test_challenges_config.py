@@ -52,22 +52,22 @@ def test_top_level_list_form(write_yaml):
 
 
 @pytest.mark.parametrize("body, message", [
-    ("- {difficulty: easy, flags: [f], target: http://x:1}", "缺少 `code`"),
-    ("- {code: web_one, flags: [f], target: http://x:1}", "必须形如"),
+    ("- {difficulty: easy, flags: [f], target: http://x:1}", "missing `code`"),
+    ("- {code: web_one, flags: [f], target: http://x:1}", "must look like"),
     ("- {code: WEB-1, difficulty: insane, flags: [f], target: http://x:1}", "difficulty"),
-    ("- {code: WEB-1, target: http://x:1}", "缺少 `flags`"),
+    ("- {code: WEB-1, target: http://x:1}", "missing `flags`"),
     ("- {code: WEB-1, flags: [], target: http://x:1}", "`flags`"),
-    ("- {code: WEB-1, flags: ['sha256:abc'], target: http://x:1}", "64 位十六进制"),
-    ("- {code: WEB-1, flags: [f]}", "必须且只能填写一个"),
-    ("- {code: WEB-1, flags: [f], target: http://x:1, compose: a.yml}", "必须且只能填写一个"),
-    ("- {code: WEB-1, flags: [f], target: http://x:1, addresses: [a:1]}", "`addresses` 只用于"),
-    ("- {code: WEB-1, flags: [f], compose: missing.yml, addresses: [a:1]}", "compose 文件不存在"),
-    ("- {code: WEB-1, flags: [f], target: http://x:1, flag: typo}", "未知字段"),
-    ("- {code: WEB-1, flags: [f], target: http://x:1}\n- {code: WEB-1, flags: [g], target: http://y:1}", "重复"),
-    ("challenges: []", "未定义任何题目"),
-    ("other: 1", "顶层只允许"),
-    ("challenges: [unclosed", "YAML 语法错误"),
-    ("- {code: WEB-1, flags: [flag{x}], target: http://x:1}", "必须加引号"),
+    ("- {code: WEB-1, flags: ['sha256:abc'], target: http://x:1}", "64-digit hex"),
+    ("- {code: WEB-1, flags: [f]}", "exactly one of"),
+    ("- {code: WEB-1, flags: [f], target: http://x:1, compose: a.yml}", "exactly one of"),
+    ("- {code: WEB-1, flags: [f], target: http://x:1, addresses: [a:1]}", "`addresses` is only for"),
+    ("- {code: WEB-1, flags: [f], compose: missing.yml, addresses: [a:1]}", "compose file does not exist"),
+    ("- {code: WEB-1, flags: [f], target: http://x:1, flag: typo}", "unknown fields"),
+    ("- {code: WEB-1, flags: [f], target: http://x:1}\n- {code: WEB-1, flags: [g], target: http://y:1}", "duplicate"),
+    ("challenges: []", "no challenges defined"),
+    ("other: 1", "top level only allows"),
+    ("challenges: [unclosed", "YAML syntax error"),
+    ("- {code: WEB-1, flags: [flag{x}], target: http://x:1}", "must be quoted"),
 ])
 def test_validation_errors(write_yaml, body, message):
     path = write_yaml(body + "\n")
@@ -78,7 +78,7 @@ def test_validation_errors(write_yaml, body, message):
 def test_compose_requires_addresses(write_yaml, tmp_path):
     (tmp_path / "dc.yml").write_text("services: {}\n")
     path = write_yaml("- {code: WEB-1, flags: [f], compose: dc.yml}\n")
-    with pytest.raises(ConfigError, match="必须填写 `addresses`"):
+    with pytest.raises(ConfigError, match="must set `addresses`"):
         load_challenges(str(path))
 
 
@@ -93,7 +93,7 @@ def test_platform_reloads_when_file_changes(write_yaml, tmp_path):
     assert [c.code for c in plat.challenges()] == ["WEB-1"]
     path.write_text("- {code: WEB-1, flags: [f], target: http://x:1}\n- {code: WEB-2, flags: [g], target: http://y:1}\n")
     import os
-    os.utime(path, (1, 1))  # 保证 mtime 变化
+    os.utime(path, (1, 1))  # make sure the mtime changes
     assert [c.code for c in plat.challenges()] == ["WEB-1", "WEB-2"]
 
 

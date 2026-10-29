@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-"""清理悬空进程：父调度器/父 worker 已死的 worker 与 claude 进程（整组清理）。
+"""Clean up dangling processes: worker and claude processes whose parent scheduler/worker has died (killed as whole process groups).
 
-判定逻辑：
-- claude 进程：沿 PPID 链向上找，没有任何存活的 main.py 祖先 → 悬空
-- worker 进程（main.py --sessions 1 且带 CRUISER_WORKER_ID）：
-  父调度器（另一个 main.py 进程）已不存在 → 悬空
-- 用户在终端直接运行的单题模式（main.py --challenge-code，无 WORKER_ID）不受影响
+Detection logic:
+- claude process: walk up the PPID chain; no live main.py ancestor -> dangling
+- worker process (main.py --sessions 1 with CRUISER_WORKER_ID):
+  the parent scheduler (another main.py process) no longer exists -> dangling
+- single-challenge mode run directly by the user in a terminal (main.py --challenge-code, no WORKER_ID) is not affected
 
-用法:
-    python kill_orphans.py          # 实际清理
-    python kill_orphans.py --dry    # 只列出，不杀
+Usage:
+    python kill_orphans.py          # actually clean up
+    python kill_orphans.py --dry    # only list, do not kill
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _read_environ(pid: int) -> str:
 
 
 def _has_live_main_ancestor(pid: int) -> bool:
-    """沿父进程链向上找存活的 main.py 进程（不含自身）。"""
+    """Walk up the parent-process chain looking for a live main.py process (excluding self)."""
     seen = set()
     p = _read_ppid(pid)
     while p > 1 and p not in seen:
@@ -60,7 +60,7 @@ def _has_live_main_ancestor(pid: int) -> bool:
 def main() -> int:
     dry = "--dry" in sys.argv
     self_pid = os.getpid()
-    dangling: list[tuple[int, str, str]] = []  # (pid, kind, cmdline 摘要)
+    dangling: list[tuple[int, str, str]] = []  # (pid, kind, cmdline summary)
 
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -71,8 +71,8 @@ def main() -> int:
         cmd = _read_cmdline(pid)
         if not cmd:
             continue
-        # 用 argv[0] 判定真实可执行文件，避免误匹配 cmdline 文本中包含
-        # "claude -p"/"main.py" 字样的 shell 包装进程（如 bash -c '...'）
+        # Use argv[0] to identify the real executable, to avoid matching shell wrapper processes whose
+        # cmdline text contains "claude -p"/"main.py" (e.g. bash -c '...')
         argv0 = cmd.split()[0] if cmd.split() else ""
         kind = None
         if (argv0 == "claude" or argv0.endswith("/claude")) and " -p " in cmd:
@@ -90,7 +90,7 @@ def main() -> int:
             dangling.append((pid, kind, cmd[:100]))
 
     if not dangling:
-        print("没有悬空进程")
+        print("No dangling processes")
         return 0
 
     killed_groups = set()
@@ -101,20 +101,20 @@ def main() -> int:
             pgid = pid
         summary = f"{kind} pid={pid} pgid={pgid} cmd={cmd}"
         if dry:
-            print(f"[DRY] 将清理: {summary}")
+            print(f"[DRY] Would clean up: {summary}")
             continue
         if pgid in killed_groups:
             continue
         killed_groups.add(pgid)
         try:
-            os.killpg(pgid, signal.SIGKILL)  # 整组杀：含 claude 的 bash 工具子进程
-            print(f"已清理: {summary}")
+            os.killpg(pgid, signal.SIGKILL)  # kill the whole group, including claude's bash tool child processes
+            print(f"Cleaned up: {summary}")
         except ProcessLookupError:
             pass
         except Exception as e:
-            print(f"清理 pid={pid} 失败: {e}")
+            print(f"Failed to clean up pid={pid}: {e}")
     if not dry:
-        print(f"共清理 {len(killed_groups)} 个悬空进程组")
+        print(f"Cleaned up {len(killed_groups)} dangling process group(s) in total")
     return 0
 
 
