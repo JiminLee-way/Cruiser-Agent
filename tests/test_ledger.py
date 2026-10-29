@@ -214,3 +214,26 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
     assert not any("should_never_be_stored_here" in t for t in texts)
     assert ledger.digest("T-1").startswith("GOAL")
     assert any(lead in t["text"] for t in taskboard.list_tasks("T-1"))
+
+
+def _codex_cmds(monkeypatch) -> dict[str, list[str]]:
+    captured = {}
+    monkeypatch.setattr(codex_engine, "binary", lambda: "codex")
+    monkeypatch.setattr(codex_engine.subprocess, "run", lambda cmd, **kw: captured.setdefault("cmd", cmd) and None)
+    codex_engine.WatcherLLM("/w").invoke(["review"])
+    return {
+        "session": codex_engine.session_cmd("go", "sys", "", ws_dir="/w", reports_dir="/r"),
+        "resume": codex_engine.resume_cmd("tid", "go on", ws_dir="/w", reports_dir="/r"),
+        "watcher": captured["cmd"],
+    }
+
+
+def test_codex_defaults_to_gpt_6_sol_with_daybreak_on_every_call(monkeypatch):
+    for name in ("CRUISER_CODEX_MODEL", "CRUISER_CODEX_WATCHER_MODEL", "CRUISER_CODEX_DAYBREAK"):
+        monkeypatch.delenv(name, raising=False)
+    for role, cmd in _codex_cmds(monkeypatch).items():
+        assert cmd[cmd.index("-m") + 1] == "gpt-6-sol", role
+        assert "daybreak=true" in cmd, role
+    monkeypatch.setenv("CRUISER_CODEX_DAYBREAK", "0")
+    for role, cmd in _codex_cmds(monkeypatch).items():
+        assert "daybreak=true" not in cmd, role
