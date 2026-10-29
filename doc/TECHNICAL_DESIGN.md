@@ -632,7 +632,7 @@ The `list_security_tools` tool lets the agent discover which security tools and 
 
 ### 10.3 Offline knowledge base and wordlists
 
-- `kb/`: three git submodules ([vulhub](https://github.com/vulhub/vulhub) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) / [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)); clone with `--recurse-submodules`. `kb/bin/nuclei` exceeds GitHub's per-file limit, so download it yourself from [Releases](https://github.com/projectdiscovery/nuclei/releases). `CRUISER_KB_DIR` can override the path. Combined with the no-network rule, all intelligence sources are local;
+- `kb/`: three git submodules ([vulhub](https://github.com/vulhub/vulhub) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) / [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)); clone with `--recurse-submodules`. `kb/bin/nuclei` exceeds GitHub's per-file limit, so download it yourself from [Releases](https://github.com/projectdiscovery/nuclei/releases). Combined with the no-network rule, all intelligence sources are local;
 - `resource/`: the `username.txt` / `password.txt` / `xss.txt` wordlists and `flag_hunting.txt` (a checklist of flag locations).
 
 ---

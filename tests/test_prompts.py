@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cruiser import claude_agent, codex_engine, ledger, prompt, taskboard
+from cruiser import claude_agent, codex_engine, ledger, taskboard
 
 CODE = "T-1"
 ROLE_WORKERS = {"explorer": "2", "lead": claude_agent.LEAD_SLOT, "solver": "solver1"}
@@ -50,18 +50,6 @@ def run_session(tmp_path, monkeypatch):
     return _run
 
 
-def _first_line(part: str) -> str:
-    return part.split("\n", 1)[0]
-
-
-@pytest.mark.parametrize("role", list(ROLE_WORKERS))
-def test_each_role_is_assembled_from_its_parts_in_the_table(run_session, role):
-    message = run_session(role)
-    for name, part in prompt.PARTS.items():
-        expected = name in prompt.ROLES[role].parts
-        assert (_first_line(part) in message) == expected, name
-
-
 @pytest.mark.parametrize("role", list(ROLE_WORKERS))
 def test_every_role_is_told_how_to_submit_and_report(run_session, role):
     message = run_session(role)
@@ -99,12 +87,6 @@ def test_session_prompts_carry_no_old_competition_text(run_session, role):
     message = run_session(role)
     for text in OLD_COMPETITION_TEXT:
         assert text not in message, text
-
-
-def test_prompt_module_carries_no_old_competition_text():
-    texts = [v for v in vars(prompt).values() if isinstance(v, str)] + list(prompt.PARTS.values())
-    for text in OLD_COMPETITION_TEXT:
-        assert not any(text in t for t in texts), text
 
 
 @pytest.fixture

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 PARTS = {
     "core": (
         "You are solving an offline puzzle. You succeed when the verifier accepts your answer.\n"
-        "- Work only inside your working directory {root}, on the target named in the task, and with the commands and files named here.\n"
+        "- Read and write files only inside your working directory {root}, plus the ledger and hint files named here. Work only on the target named in the task.\n"
         "- Treat a claim as a fact only after you have checked it by running code against the real artifact. Until then it is a lead.\n"
         "- Do not look up this challenge or its writeups on the internet. Installing packages is fine.\n"
         "- Write large output to a file and filter it instead of printing it whole.\n"

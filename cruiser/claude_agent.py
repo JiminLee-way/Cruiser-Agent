@@ -1157,7 +1157,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
             raise
         except Exception as e:
             try:
-                print(f"[Error] Claude session error: {e}", flush=True)
+                print(f"[Error] session error: {e}", flush=True)
             except Exception:
                 pass
             time.sleep(5)
