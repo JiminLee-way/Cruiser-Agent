@@ -121,7 +121,6 @@ class _Ledger:
     def __init__(self, entries: list[Entry], digest: Optional[dict]):
         self.entries = entries
         self.digest = digest
-        self.changed = False
 
     def document(self) -> dict:
         return {"entries": self.entries, "digest": self.digest}
@@ -139,6 +138,14 @@ class _Ledger:
     def same_flag(self, text: str) -> bool:
         key = _flag_index(text)
         return bool(key) and any(_flag_index(e["text"]) == key for e in self.live(("flag_method",)))
+
+
+class _Writer(_Ledger):
+    """Only _commit creates one, then persists it if changed."""
+
+    def __init__(self, led: _Ledger):
+        super().__init__(led.entries, led.digest)
+        self.changed = False
 
     def add(self, author: str, kind: Kind, text: str, task: str = "") -> Optional[str]:
         text = _clean(text, _TEXT_CAP[kind])
@@ -232,11 +239,11 @@ def _render(led: _Ledger) -> str:
     return "".join(f"[{e['ts']}] session: {e['author']}\ninfo: {_view_line(e)}\n{sep}\n" for e in led.live())
 
 
-def _commit(code: str, change: Callable[[_Ledger], T]) -> T:
+def _commit(code: str, change: Callable[[_Writer], T]) -> T:
     os.makedirs(_reports_dir(), exist_ok=True)
     with open(_ledger_path(code) + ".lock", "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        led = _load_strict(code)
+        led = _Writer(_load_strict(code))
         result = change(led)
         if led.changed:
             _write_atomic(_ledger_path(code), json.dumps(led.document(), ensure_ascii=False))
