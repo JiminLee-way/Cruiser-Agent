@@ -122,20 +122,18 @@ class _Ledger:
     def live(self, kinds: tuple[str, ...] = tuple(_KIND_TAG)) -> list[Entry]:
         return [e for e in self.entries if e["kind"] in kinds and _status(e) != "superseded"]
 
-    def duplicate(self, kind: Kind, text: str, task: str) -> Optional[Entry]:
+    def same_text(self, kind: Kind, text: str, task: str) -> Optional[Entry]:
         group = ("result",) if kind == "result" else _FACT_KINDS
-        key = _flag_index(text) if kind == "flag_method" else ""
-        for e in self.live(group):
-            if _norm(e["text"]) == _norm(text) and e.get("task", "") == task:
-                return e
-            if key and e["kind"] == "flag_method" and _flag_index(e["text"]) == key:
-                return e
-        return None
+        return next((e for e in self.live(group) if _norm(e["text"]) == _norm(text) and e.get("task", "") == task), None)
+
+    def same_flag(self, text: str) -> bool:
+        key = _flag_index(text)
+        return bool(key) and any(_flag_index(e["text"]) == key for e in self.live(("flag_method",)))
 
     def add(self, author: str, kind: Kind, text: str, task: str = "") -> Optional[str]:
         text = _clean(text, _TEXT_CAP[kind])
         task = _clean(task, _TASK_CAP) if kind == "result" else ""
-        if not text or self.duplicate(kind, text, task):
+        if not text or self.same_text(kind, text, task) or (kind == "flag_method" and self.same_flag(text)):
             return None
         eid = ""
         while not eid or self.find(eid):
@@ -172,7 +170,7 @@ class _Ledger:
         text = _clean(new_text, _TEXT_CAP[kind])
         if not text:
             return None
-        same = self.duplicate(kind, text, task)
+        same = self.same_text(kind, text, task)
         if same is old:
             return old["id"]
         target = same["id"] if same else self.add(by, kind, text, task)
