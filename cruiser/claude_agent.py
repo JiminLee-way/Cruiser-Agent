@@ -25,12 +25,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .flagshape import FLAG_RE, redact
 from .llm import get_claude_provider_env, get_watcher_llm
-from .prompt import (
-    CLAUDE_SOLVER_SYSTEM_PROMPT,
-    CLAUDE_SOLVER_TASK_TEMPLATE,
-    CLAUDE_SYSTEM_PROMPT,
-    CLAUDE_TASK_TEMPLATE,
-)
+from . import prompt as prompts
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -750,21 +745,6 @@ def _capture_submitted_flag(message: dict) -> Optional[str]:
     return None
 
 
-_LEAD_NOTE = (
-    "\n\n[Your role: integration lead] You own the end-to-end solution of this challenge. "
-    "Other sessions and solvers explore in parallel and report into the shared ledger. "
-    "Re-read the solve-state digest and task results regularly, connect their findings, and keep driving "
-    "the next integration step toward the flag; do not only widen the exploration.\n"
-)
-
-_RESUME_TEMPLATE = (
-    "[Scheduler] This is the same conversation, continued in a new scheduling round. "
-    "Your earlier work, files and conclusions are still valid. Current shared solve state:\n\n"
-    "{context}\n\n"
-    "Continue from where you left off. Follow the flag submission protocol given at the start."
-)
-
-
 def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: str, quiet: bool, step_counter: list[int], solver_task: Optional[str] = None) -> Optional[str]:
     """Run one Claude session until all of this challenge's flags are confirmed / the turn limit is reached / it is killed externally.
 
@@ -772,41 +752,6 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     ensuring the main.py scheduler's step threshold (which may exceed a single session's 100-turn limit) can trigger.
     Returns the confirmed flag JSON string (only when platform progress is complete); returns None if incomplete or unsolved, and the caller starts a new session to continue.
     """
-    root = _project_root()
-    reports_dir = os.path.join(os.getcwd(), "reports")
-    tools_dir = os.path.join(root, "tools")
-    submit_cmd = f'"{sys.executable}" {os.path.join(tools_dir, "submit_flag.py")}'
-    dirsearch_cmd = f'"{sys.executable}" {os.path.join(tools_dir, "dirsearch_scan.py")}'
-    report_cmd = f'"{sys.executable}" {os.path.join(tools_dir, "task_board.py")} report {code} {worker_id}'
-    decompile_script = os.path.join(tools_dir, "decompile.py")
-    res_dir = os.path.join(root, "resource")
-    if solver_task:
-        # solver directed mode: work on a single direction, with the focused system prompt and task template
-        system_prompt = CLAUDE_SOLVER_SYSTEM_PROMPT
-        prompt = CLAUDE_SOLVER_TASK_TEMPLATE.format(
-            target=target or "(not provided)",
-            code=code or "unknown",
-            task=solver_task,
-            info_file=os.path.join(reports_dir, f"info_{code}.txt"),
-            submit_cmd=submit_cmd,
-            report_cmd=report_cmd,
-            res_dir=res_dir,
-            decompile_script=decompile_script,
-            dirsearch_cmd=dirsearch_cmd,
-        )
-    else:
-        system_prompt = CLAUDE_SYSTEM_PROMPT
-        prompt = CLAUDE_TASK_TEMPLATE.format(
-            target=target or "(not provided; get it from the blackboard and hint first)",
-            code=code or "unknown",
-            hint=hint or "none",
-            info_file=os.path.join(reports_dir, f"info_{code}.txt"),
-            hint_file=os.path.join(reports_dir, f"hint_{code}.txt"),
-            submit_cmd=submit_cmd,
-            res_dir=res_dir,
-            decompile_script=decompile_script,
-            dirsearch_cmd=dirsearch_cmd,
-        )
     from . import engines, ledger
     from .opencode_engine import context_block
     eng = engines.current()
@@ -814,14 +759,29 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     # Explorer slots keep one engine conversation across sessions and stages; solvers always start fresh.
     slot = None if solver_task else worker_id
     lead = slot == LEAD_SLOT
+    role = "solver" if solver_task else "lead" if lead else "explorer"
+    tools_dir = os.path.join(_project_root(), "tools")
+    reports_dir = os.path.join(os.getcwd(), "reports")
+    work_root = eng.working_root(ws_dir) if hasattr(eng, "working_root") else ws_dir
+    system_prompt, prompt = prompts.build(
+        role,
+        skills=os.path.isdir(os.path.join(work_root, "skills")),
+        root=work_root,
+        target=target or "(not provided)",
+        code=code or "unknown",
+        hint=hint or "none",
+        task=solver_task or "",
+        info_file=os.path.join(reports_dir, f"info_{code}.txt"),
+        hint_file=os.path.join(reports_dir, f"hint_{code}.txt"),
+        submit_cmd=f'"{sys.executable}" {os.path.join(tools_dir, "submit_flag.py")}',
+        report_cmd=f'"{sys.executable}" {os.path.join(tools_dir, "task_board.py")} report {code} {worker_id}',
+    )
     prior = ledger.session_get(code, slot) if slot else None
     resume_id = prior.get("id") if prior and (prior.get("engine"), prior.get("ws")) == (eng_name, ws_dir) else None
-    if lead:
-        prompt += _LEAD_NOTE
     if resume_id:
-        resume_prompt = _RESUME_TEMPLATE.format(context=context_block(reports_dir, code) or "(empty)")
+        resume_prompt = prompts.RESUME_TEMPLATE.format(context=context_block(reports_dir, code) or "(empty)")
         if lead:
-            resume_prompt += _LEAD_NOTE
+            resume_prompt += "\n\n" + prompts.PARTS["lead"]
         if eng is not None:
             cmd = eng.resume_cmd(resume_id, resume_prompt, ws_dir=ws_dir, reports_dir=reports_dir)
         else:
@@ -878,7 +838,7 @@ def _claude_cmd(prompt: str, system_prompt: str, ws_dir: str, resume_id: Optiona
         "--verbose",
         "--permission-mode", "bypassPermissions",
         "--append-system-prompt", system_prompt,
-        # Online lookup is forbidden in CTF competitions: remove WebSearch/WebFetch from the toolset (in headless mode bypassPermissions would allow them automatically).
+        # The core rules forbid looking the challenge up online; in headless mode bypassPermissions would allow these tools.
         "--disallowedTools", "WebSearch,WebFetch",
     ]
     # limit the per-session turns only when a positive turn limit is explicitly configured; unlimited by default.

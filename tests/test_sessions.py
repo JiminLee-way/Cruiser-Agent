@@ -67,7 +67,7 @@ def test_solver_closing_message_is_recorded_only_when_it_did_not_report(
     stub.write_text(STUB.format(report=reports_itself))
     fake = SimpleNamespace(
         NAME="stub", BINARY_NAME=sys.executable,
-        session_cmd=lambda prompt, *a, **kw: [sys.executable, str(stub), prompt],
+        session_cmd=lambda prompt, system_prompt, *a, **kw: [sys.executable, str(stub), system_prompt + "\n" + prompt],
         claude_events=claude_agent._claude_events,
     )
     monkeypatch.setattr(engines, "current", lambda: fake)

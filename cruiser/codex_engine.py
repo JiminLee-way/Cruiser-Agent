@@ -63,6 +63,10 @@ def _full_access() -> bool:
     return (os.environ.get("CRUISER_CODEX_SANDBOX") or "").strip() == "danger-full-access"
 
 
+def working_root(ws_dir: str) -> str:
+    return os.environ.get("CRUISER_CODEX_ROOT") or ws_dir
+
+
 def _writable_extra(root: str, *dirs: str) -> list[str]:
     return [d for d in dirs if d and os.path.abspath(d) != os.path.abspath(root)]
 
@@ -73,7 +77,7 @@ def session_cmd(prompt: str, system_prompt: str, context: str, *, ws_dir: str, r
     if context:
         message += context + "\n\n"
     message += prompt
-    root = os.environ.get("CRUISER_CODEX_ROOT") or ws_dir
+    root = working_root(ws_dir)
     if _full_access():
         return _base_cmd(model or solve_model()) + [
             "--dangerously-bypass-approvals-and-sandbox", "-C", root, message,
@@ -92,7 +96,7 @@ def resume_cmd(session_id: str, prompt: str, *, ws_dir: str, reports_dir: str,
     if _full_access():
         cmd += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
-        root = os.environ.get("CRUISER_CODEX_ROOT") or ws_dir
+        root = working_root(ws_dir)
         roots = json.dumps([root] + _writable_extra(root, reports_dir, ws_dir))
         cmd += ["-c", 'sandbox_mode="workspace-write"', "-c", f"sandbox_workspace_write.writable_roots={roots}"]
         if os.environ.get("CRUISER_CODEX_NETWORK") == "1":
