@@ -331,7 +331,7 @@ def digest(code: str) -> str:
     return (_load_or_empty(code).digest or {}).get("text", "")
 
 
-def _fit_context(digest_text: str, lines: list[str], budget: int) -> str:
+def _fit_context(digest_text: str, lines: list[str], budget: int) -> tuple[str, int]:
     lines = [ln[:_LINE_CAP] for ln in lines]
     gap = "\n\n"
     want = len(_ENTRIES_HEAD) + sum(len(ln) + 1 for ln in lines) - 1 if lines else 0
@@ -352,13 +352,25 @@ def _fit_context(digest_text: str, lines: list[str], budget: int) -> str:
     parts = [digest_part] if digest_part else []
     if picked:
         parts.append(_ENTRIES_HEAD + "\n".join(reversed(picked)))
-    return gap.join(parts)
+    return gap.join(parts), len(picked)
+
+
+def _totals(code: str, live: list[Entry], shown: int) -> str:
+    facts = sum(e["kind"] in _FACT_KINDS for e in live)
+    return (f"[Ledger] {len(live)} live entries ({facts} facts, {len(live) - facts} task results), "
+            f"{shown} shown newest first; full list: reports/info_{code}.txt")
 
 
 def context_text(code: str, budget: int = 3000) -> str:
     led = _load_or_empty(code)
-    lines = ["- " + _view_line(e) for e in led.live()]
-    return _fit_context((led.digest or {}).get("text", ""), lines, budget)
+    live = led.live()
+    digest_text = (led.digest or {}).get("text", "")
+    if not live and not digest_text:
+        return ""
+    # shown <= len(live), so the line written with len(live) is the longest it can get
+    reserve = len(_totals(code, live, len(live))) + 1
+    body, shown = _fit_context(digest_text, ["- " + _view_line(e) for e in live], budget - reserve)
+    return "\n".join(filter(None, [_totals(code, live, shown), body]))
 
 
 def session_get(code: str, slot: str) -> Optional[dict]:

@@ -67,9 +67,25 @@ def test_context_text_puts_digest_first_and_respects_budget(reports):
         ledger.add_fact("T-1", "1", f"entry number {i} " + "x" * 40)
     ledger.set_digest("T-1", "w", "GOAL: get DH{...}\nOPEN LEADS: seed candidate")
     text = ledger.context_text("T-1", budget=1500)
-    assert text.startswith("[Solve state")
+    assert text.splitlines()[0].startswith("[Ledger] 200 live entries")
+    assert text.splitlines()[1].startswith("[Solve state")
     assert len(text) <= 1500
     assert "entry number 199" in text and "entry number 0 " not in text
+
+
+def test_context_text_starts_with_ledger_totals_inside_the_budget(reports):
+    fids = [ledger.add_fact("T-1", "1", f"fact number {i} " + "x" * 30) for i in range(120)]
+    for i in range(60):
+        ledger.add_result("T-1", f"solver{i}", f"direction {i}", f"result number {i} " + "y" * 30)
+    ledger.supersede("T-1", fids[0], "fact number 1 " + "x" * 30, "w")
+    ledger.supersede("T-1", fids[2], "fact number 3 " + "x" * 30, "w")
+    ledger.set_digest("T-1", "w", "GOAL: get DH{...}\nOPEN LEADS: " + "z" * 900)
+    text = ledger.context_text("T-1", budget=3000)
+    shown = [ln for ln in text.splitlines() if ln.startswith("- ")]
+    assert text.splitlines()[0] == (f"[Ledger] 178 live entries (118 facts, 60 task results), {len(shown)} shown newest first;"
+                                    " full list: reports/info_T-1.txt")
+    assert 0 < len(shown) < 178 and "result number 59 " in shown[-1]
+    assert len(text) <= 3000
 
 
 def _writer(path: str, n: int, tag: str) -> None:
