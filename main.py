@@ -1,4 +1,4 @@
-from cruiser.claude_agent import run_auto_scan
+from cruiser.claude_agent import SINGLE_WORKER_ID, run_auto_scan, workspace_dir
 import argparse
 import atexit
 import json
@@ -9,7 +9,6 @@ import threading
 import time
 import re
 import signal
-import uuid
 from cruiser.challenges import CHALLENGES_ENV, PlatformError, get_platform, target_host_port
 from cruiser.taskboard import claim_task
 from cruiser import runtime
@@ -208,15 +207,6 @@ def main():
             if not target:
                 print(json.dumps({"flag": None, "error": f"target for challenge {code} not ready"}, ensure_ascii=False))
                 return
-            # create a dedicated workspace for the single session
-            try:
-                base_ws = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-                os.makedirs(base_ws, exist_ok=True)
-                ws_dir = os.path.join(base_ws, f"ws_single_{uuid.uuid4().hex[:8]}")
-                os.makedirs(ws_dir, exist_ok=True)
-                os.environ["CRUISER_WORKSPACE_DIR"] = ws_dir
-            except Exception:
-                pass
             try:
                 result = run_auto_scan(target, max_steps=args.max_steps, quiet=args.quiet, hint=args.hint, challenge_code=code, solver_task=args.solver_task)
             finally:
@@ -261,14 +251,9 @@ def main():
                 print(f"[Fetcher] {code} target not ready, retrying in 5 seconds…", flush=True)
                 time.sleep(5)
                 continue
-            # create a dedicated workspace for the single-session loop
             try:
-                base_ws = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-                os.makedirs(base_ws, exist_ok=True)
-                ws_dir = os.path.join(base_ws, f"ws_single_{uuid.uuid4().hex[:8]}")
-                os.makedirs(ws_dir, exist_ok=True)
-                os.environ["CRUISER_WORKSPACE_DIR"] = ws_dir
-            except Exception:
+                os.environ["CRUISER_WORKSPACE_DIR"] = workspace_dir(code, SINGLE_WORKER_ID, resumable=True)
+            except OSError:
                 pass
             try:
                 result = run_auto_scan(target, max_steps=args.max_steps, quiet=args.quiet, hint=args.hint, challenge_code=code or None)
@@ -331,14 +316,9 @@ def main():
         if model:
             env["ANTHROPIC_MODEL"] = model
             env["ANTHROPIC_SMALL_FAST_MODEL"] = model
-        # create a dedicated workspace for the child session
         try:
-            base_ws = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-            os.makedirs(base_ws, exist_ok=True)
-            ws_dir = os.path.join(base_ws, f"ws_{(code or 'nocode')}_{idx}_{uuid.uuid4().hex[:8]}")
-            os.makedirs(ws_dir, exist_ok=True)
-            env["CRUISER_WORKSPACE_DIR"] = ws_dir
-        except Exception:
+            env["CRUISER_WORKSPACE_DIR"] = workspace_dir(code or "", str(idx), resumable=True)
+        except OSError:
             pass
         # debug mode: all output goes to stdout
         if not args.quiet:
@@ -404,12 +384,8 @@ def main():
             env.pop("CRUISER_DEBUG_STDERR", None)
             env["CRUISER_QUIET"] = "0"
         try:
-            base_ws = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-            os.makedirs(base_ws, exist_ok=True)
-            ws_dir = os.path.join(base_ws, f"ws_solver_{code}_{sid}_{uuid.uuid4().hex[:8]}")
-            os.makedirs(ws_dir, exist_ok=True)
-            env["CRUISER_WORKSPACE_DIR"] = ws_dir
-        except Exception:
+            env["CRUISER_WORKSPACE_DIR"] = workspace_dir(code, f"solver{sid}", resumable=False)
+        except OSError:
             pass
         p = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

@@ -129,6 +129,16 @@ def _project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def workspace_dir(code: str, worker_id: str, *, resumable: bool) -> str:
+    """Create and return a worker's working directory. A resumable explorer slot keeps one per challenge
+    across rounds, so its resumed conversation finds the files it wrote; a one-shot solver gets a fresh one."""
+    base = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
+    name = f"ws_{code or 'nocode'}_{worker_id}" + ("" if resumable else f"_{uuid.uuid4().hex[:8]}")
+    path = os.path.join(base, name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Blackboard watcher: inside each worker process an LLM periodically reviews recent activity and the current blackboard,
 # and appends new information worth sharing in the agreed format (guaranteed by the mechanism, not relying on Claude's own initiative).
@@ -754,7 +764,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     slot = None if solver_task else worker_id
     lead = slot == LEAD_SLOT
     prior = ledger.session_get(code, slot) if slot else None
-    resume_id = prior.get("id") if prior and prior.get("engine") == eng_name else None
+    resume_id = prior.get("id") if prior and (prior.get("engine"), prior.get("ws")) == (eng_name, ws_dir) else None
     if lead:
         prompt += _LEAD_NOTE
     if resume_id:
@@ -780,10 +790,10 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         text=True,
         bufsize=1,
         cwd=ws_dir,
-        env=os.environ.copy() if eng is not None else _claude_env(),
+        env=engines.child_env(ws_dir, None if eng is not None else _claude_env()),
     )
     events = eng.claude_events(proc.stdout) if eng is not None else _claude_events(proc.stdout)
-    session = {"slot": slot, "engine": eng_name, "last_text": "", "steps": 0}
+    session = {"slot": slot, "engine": eng_name, "ws": ws_dir, "last_text": "", "steps": 0}
     flag_json = _drive_session(proc, events, code, worker_id, quiet, step_counter, session)
     if resume_id and session["steps"] == 0 and not flag_json:
         ledger.session_clear(code, slot)  # resume produced nothing: start the next session fresh
@@ -972,7 +982,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
             etype = evt.get("type")
             if etype == "system" and evt.get("session_id") and session and session.get("slot"):
                 from . import ledger
-                ledger.session_set(code, session["slot"], session["engine"], str(evt["session_id"]))
+                ledger.session_set(code, session["slot"], session["engine"], str(evt["session_id"]), ws=session["ws"])
             elif etype == "assistant":
                 session_step += 1
                 step_counter[0] += 1
@@ -1095,12 +1105,9 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
 
     worker_id = os.environ.get("CRUISER_WORKER_ID", SINGLE_WORKER_ID)
     code = challenge_code or os.environ.get("CRUISER_CHALLENGE_CODE") or ""
-    ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR") or ""
-    if not ws_dir:
-        base_ws = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-        os.makedirs(base_ws, exist_ok=True)
-        ws_dir = os.path.join(base_ws, f"ws_claude_{uuid.uuid4().hex[:8]}")
+    ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR") or workspace_dir(code, worker_id, resumable=not solver_task)
     os.makedirs(ws_dir, exist_ok=True)
+    os.environ["CRUISER_WORKSPACE_DIR"] = ws_dir  # the prompts and the watcher LLMs read it
 
     # solver directed mode: run only one session, return when done / turn limit reached, no loop
     if solver_task:

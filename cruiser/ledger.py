@@ -376,9 +376,11 @@ def _update_sessions(code: str, mutate) -> None:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def session_set(code: str, slot: str, engine: str, session_id: str) -> None:
+def session_set(code: str, slot: str, engine: str, session_id: str, ws: str = "") -> None:
+    """Remember a slot's engine session and the workspace it ran in (a resume is only valid in the same one)."""
     if code and slot and session_id:
-        _update_sessions(code, lambda d: d.__setitem__(slot, {"engine": engine, "id": session_id, "ts": int(time.time())}))
+        _update_sessions(code, lambda d: d.__setitem__(
+            slot, {"engine": engine, "id": session_id, "ws": ws, "ts": int(time.time())}))
 
 
 def session_clear(code: str, slot: str) -> None:
