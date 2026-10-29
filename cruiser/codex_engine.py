@@ -25,8 +25,8 @@ from . import opencode_engine as _opencode
 NAME = "codex"
 BINARY_NAME = "codex"
 context_block = _opencode.context_block  # same session-start injection as the opencode engine
-_DEFAULT_MODEL = "gpt-6.1-terra"
-_DEFAULT_WATCHER_MODEL = "gpt-daybreak-blue-latest"
+_DEFAULT_MODEL = "gpt-6-sol"
+_DEFAULT_WATCHER_MODEL = "gpt-6-sol"
 
 
 def enabled() -> bool:
@@ -50,8 +50,8 @@ def binary() -> str:
 
 def _base_cmd(model: str, resume: bool = False) -> list[str]:
     cmd = [binary(), "exec"] + (["resume"] if resume else []) + ["--json", "--skip-git-repo-check", "-m", model]
-    # Same as the Daybreak switch in the Codex app, for accounts that have Daybreak enabled
-    if os.environ.get("CRUISER_CODEX_DAYBREAK") == "1":
+    # Same as the Daybreak switch in the Codex app; on unless CRUISER_CODEX_DAYBREAK=0
+    if (os.environ.get("CRUISER_CODEX_DAYBREAK") or "1").strip() != "0":
         cmd += ["-c", "daybreak=true"]
     effort = (os.environ.get("CRUISER_CODEX_EFFORT") or "").strip()
     if effort:

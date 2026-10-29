@@ -1,7 +1,6 @@
 """Exploration-direction task board: the watcher publishes directions, workers claim them (claiming erases them) and report back.
 
-One file per challenge, reports/tasks_<code>.txt, line format:
-    [t-xxxxxx] direction text (one line)
+One file per challenge, reports/tasks_<code>.txt.
 All reads and writes happen under a file lock; rewrites go through a temp file + atomic os.replace,
 so when several workers claim the same direction concurrently only one succeeds.
 """
@@ -12,12 +11,14 @@ import os
 import re
 import time
 import uuid
-from typing import Optional
+from typing import Iterable, Optional
 
+from . import ledger
 from .flagshape import redact
 
 _MAX_PENDING = 5  # maximum number of pending directions on the board; nothing more is published beyond this
 _TASK_LINE_RE = re.compile(r"^\[(t-[0-9a-f]{6})\]\s*(.*)$")
+_BASIS_SUFFIX_RE = re.compile(r" \(from ((?:[fr]-[0-9a-f]{6})(?:, [fr]-[0-9a-f]{6})*)\)$")
 # Claim memory duration: a direction erased by a claim still takes part in dedup for this long (prevents the watcher from republishing it);
 # it unfreezes automatically after the timeout, so a claimer dying abnormally does not lock the direction forever
 _CLAIMED_TTL_S = 45 * 60
@@ -81,16 +82,16 @@ def _write_lines_atomic(path: str, lines: list[str]) -> None:
     os.replace(tmp, path)
 
 
+def _direction(m: re.Match) -> dict:
+    text = m.group(2).strip()
+    basis = _BASIS_SUFFIX_RE.search(text)
+    return {"id": m.group(1), "text": text, "basis_ids": basis.group(1).split(", ") if basis else []}
+
+
 def list_tasks(code: str) -> list[dict]:
-    """Return the list of pending directions: [{"id": "t-xxxxxx", "text": "..."}]."""
     if not code:
         return []
-    out = []
-    for ln in _read_lines_unlocked(_tasks_path(code)):
-        m = _TASK_LINE_RE.match(ln.strip())
-        if m:
-            out.append({"id": m.group(1), "text": m.group(2).strip()})
-    return out
+    return [_direction(m) for ln in _read_lines_unlocked(_tasks_path(code)) if (m := _TASK_LINE_RE.match(ln.strip()))]
 
 
 def list_claimed(code: str, ttl_s: float = _CLAIMED_TTL_S) -> list[dict]:
@@ -115,12 +116,12 @@ def list_claimed(code: str, ttl_s: float = _CLAIMED_TTL_S) -> list[dict]:
     return out
 
 
-def publish_task(code: str, text: str) -> bool:
-    """Watcher publishes a direction: deduplicated against "pending board + recently claimed"; nothing is published when the board is full (>=5).
-    Returns whether anything was actually written."""
+def publish_task(code: str, text: str, basis_ids: Iterable[str] = ()) -> bool:
+    """Watcher publishes a direction: deduplicated against "pending board + recently claimed"; nothing is published when the board is full (>=5)."""
     text = redact(text).strip()
     if not code or not text:
         return False
+    text += ledger.basis_suffix(ledger.live_ids(code, basis_ids))
     os.makedirs(_reports_dir(), exist_ok=True)
     with open(_lock_path(code), "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
@@ -162,7 +163,7 @@ def claim_task(code: str, worker_id: str, task_id: Optional[str] = None) -> Opti
             for ln in lines:
                 m = _TASK_LINE_RE.match(ln.strip())
                 if m and claimed is None and (task_id is None or m.group(1) == task_id):
-                    claimed = {"id": m.group(1), "text": m.group(2).strip()}
+                    claimed = _direction(m)
                     continue  # erase
                 keep.append(ln)
             if claimed is None:
@@ -180,28 +181,16 @@ def claim_task(code: str, worker_id: str, task_id: Optional[str] = None) -> Opti
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def retire_task(code: str, ref: str) -> bool:
-    """For watcher curation: remove a direction from the board. ref is matched exactly by task id (t-xxxxxx) first,
-    otherwise by content similarity. Returns whether anything was actually removed."""
-    ref = (ref or "").strip()
-    if not code or not ref:
+def retire_task(code: str, task_id: str) -> bool:
+    if not code or not task_id:
         return False
     os.makedirs(_reports_dir(), exist_ok=True)
-    id_match = re.fullmatch(r"t-[0-9a-f]{6}", ref)
     with open(_lock_path(code), "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             lines = _read_lines_unlocked(_tasks_path(code))
-            keep: list[str] = []
-            removed = False
-            for ln in lines:
-                m = _TASK_LINE_RE.match(ln.strip())
-                if m and not removed:
-                    if (id_match and m.group(1) == ref) or (not id_match and _similar(ref, m.group(2).strip())):
-                        removed = True
-                        continue
-                keep.append(ln)
-            if not removed:
+            keep = [ln for ln in lines if (m := _TASK_LINE_RE.match(ln.strip())) is None or m.group(1) != task_id]
+            if len(keep) == len(lines):
                 return False
             _write_lines_atomic(_tasks_path(code), keep)
             return True
@@ -209,9 +198,8 @@ def retire_task(code: str, ref: str) -> bool:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def report_task(code: str, worker_id: str, text: str, task: str = "") -> bool:
-    from . import ledger
+def report_task(code: str, worker_id: str, text: str, task: str = "", basis: tuple[str, ...] | list[str] = ()) -> bool:
     if not task:
         mine = [c["text"] for c in list_claimed(code) if c["worker"] == worker_id]
         task = mine[-1] if mine else ""
-    return ledger.add_result(code, worker_id, task, text) is not None
+    return ledger.add_result(code, worker_id, task, text, basis=basis) is not None

@@ -100,15 +100,57 @@ def test_only_the_lead_watcher_rewrites_the_digest(reports, run_watcher, worker)
     assert ledger.digest(CODE) == "GOAL: rewritten by the lead"
 
 
-def test_watcher_does_not_store_a_dict_add_item(reports, run_watcher):
-    run_watcher("2", {"add": [{"text": "grid is 9x9"}, "lead: seed 0x1234 gives the prefix"]})
-    assert [f["text"] for f in ledger.facts(CODE)] == ["lead: seed 0x1234 gives the prefix"]
+def test_watcher_add_items_carry_basis_ids_and_confidence(reports, run_watcher):
+    known = ledger.add_fact(CODE, "1", "the grid is read from /static/grid.bin")
+    run_watcher("2", {"add": [
+        {"text": "grid is 9x9", "basis_ids": [known, "f-unknwn", 7, ""], "confidence": "inferred"},
+        {"text": "the cookie is signed", "basis_ids": known, "confidence": ["inferred"]},
+        {"text": "flag{never_stored_here}", "confidence": "observed"},
+        {"basis_ids": [known]},
+        {"text": "lead: seed 0x1234 gives the prefix", "confidence": "certain"},
+    ]})
+    rows = {f["text"]: (f["basis"], f["confidence"]) for f in ledger.facts(CODE) if f["id"] != known}
+    assert rows == {
+        "grid is 9x9": ([known], "inferred"),
+        "the cookie is signed": ([], ""),
+        "lead: seed 0x1234 gives the prefix": ([], ""),
+    }
+
+
+def test_published_direction_keeps_only_live_basis_ids(reports, run_watcher):
+    lead = ledger.add_fact(CODE, "1", "lead: seed 0x1234 gives the prefix")
+    run_watcher("2", {"suggest_tasks": [
+        {"text": "derive the output from the seed", "basis_ids": [lead, "f-unknwn"]},
+        {"text": "dump the session table", "basis_ids": "f-aaaaaa"},
+    ]})
+    tasks = {t["text"]: t["basis_ids"] for t in taskboard.list_tasks(CODE)}
+    assert tasks == {f"derive the output from the seed (from {lead})": [lead], "dump the session table": []}
+
+
+def test_watcher_view_shows_basis_and_inferred_tags(reports, run_watcher, monkeypatch):
+    seen: list[str] = []
+    known = ledger.add_fact(CODE, "1", "the grid is read from /static/grid.bin")
+    fid = ledger.add_fact(CODE, "1", "grid is 9x9", basis=[known], confidence="inferred")
+    rid = ledger.add_result(CODE, "solver3", "parse the grid", "rows are 9 bytes", basis=[fid])
+
+    class FakeLLM:
+        def invoke(self, messages):
+            seen.append("\n".join(m.content for m in messages))
+            return SimpleNamespace(content="{}")
+
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+    claude_agent._watcher_curate_blackboard(CODE, "2", "Thought: read the grid", str(reports))
+    [prompt] = seen
+    [fact_row] = [ln for ln in prompt.splitlines() if ln.startswith(f"- {fid} ")]
+    [result_row] = [ln for ln in prompt.splitlines() if ln.startswith(f"- {rid} ")]
+    assert "[inferred]" in fact_row and fact_row.endswith(f" (from {known})")
+    assert result_row.endswith(f" (from {fid})")
 
 
 def test_watcher_does_not_publish_a_task_without_text(reports, run_watcher):
     run_watcher("2", {"suggest_tasks": [
-        {"basis": "f-aaaaaa"},
-        {"text": "derive the output from the seed", "basis": "f-bbbbbb"},
+        {"basis_ids": ["f-aaaaaa"]},
+        {"text": "derive the output from the seed", "basis_ids": ["f-bbbbbb"]},
     ]})
     tasks = [t["text"] for t in taskboard.list_tasks(CODE)]
     assert len(tasks) == 1 and tasks[0].startswith("derive the output from the seed"), tasks
@@ -122,3 +164,77 @@ def test_max_length_digest_leaves_room_for_newest_entries(reports):
     assert "[Newest ledger entries]" in text
     assert "entry number 4" in text
     assert len(text) <= 3000
+
+
+def test_watcher_retires_a_direction_only_by_its_exact_id(reports, run_watcher):
+    assert taskboard.publish_task(CODE, "brute force the admin login")
+    assert taskboard.publish_task(CODE, "read the backup archive")
+    by_text = {t["text"]: t["id"] for t in taskboard.list_tasks(CODE)}
+    run_watcher("2", {"retire_tasks": ["brute force the admin login"]})
+    assert set(t["id"] for t in taskboard.list_tasks(CODE)) == set(by_text.values())
+    run_watcher("2", {"retire_tasks": [by_text["brute force the admin login"]]})
+    assert [t["id"] for t in taskboard.list_tasks(CODE)] == [by_text["read the backup archive"]]
+
+
+def test_report_cli_passes_basis_ids_to_the_ledger(repo_copy, monkeypatch):
+    import subprocess
+    import sys
+
+    from conftest import subprocess_env
+    monkeypatch.setattr(ledger, "_reports_dir", lambda: str(repo_copy / "reports"))
+    known = ledger.add_fact(CODE, "1", "admin cookie is base64 json")
+    out = subprocess.run(
+        [sys.executable, "tools/task_board.py", "report", CODE, "solver1", "forged admin cookie accepted",
+         "--basis", f"{known},f-unknwn"],
+        cwd=repo_copy, env=subprocess_env(), capture_output=True, text=True, timeout=30,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    [r] = ledger.results(CODE)
+    assert (r["text"], r["basis"]) == ("forged admin cookie accepted", [known])
+
+
+@pytest.fixture
+def watcher_prompt(reports, monkeypatch):
+    def _prompt(worker_id: str) -> str:
+        seen: list[str] = []
+
+        class FakeLLM:
+            def invoke(self, messages):
+                seen.append("\n".join(m.content for m in messages))
+                return SimpleNamespace(content="{}")
+
+        monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+        claude_agent._watcher_curate_blackboard(CODE, worker_id, "Thought: read the grid", str(reports))
+        [prompt] = seen
+        return prompt
+    return _prompt
+
+
+def _rows(prompt: str, ids: list[str]) -> list[str]:
+    return [i for ln in prompt.splitlines() for i in ids if ln.startswith(f"- {i} ")]
+
+
+def test_lead_watcher_sees_entries_newer_than_the_digest_first(reports, watcher_prompt, monkeypatch):
+    clock = ["2026-01-01 10:00:00"]
+    monkeypatch.setattr(ledger, "_now", lambda: clock[0])
+    old_fact = ledger.add_fact(CODE, "1", "the grid is read from /static/grid.bin")
+    clock[0] = "2026-01-01 10:00:01"
+    old_result = ledger.add_result(CODE, "solver3", "parse the grid", "rows are 9 bytes")
+    clock[0] = "2026-01-01 10:00:02"
+    ledger.set_digest(CODE, "1", "GOAL: read the grid")
+    clock[0] = "2026-01-01 10:00:03"
+    new_result = ledger.add_result(CODE, "solver4", "seed the PRNG", "seed 0x1234 reproduces row 0")
+    clock[0] = "2026-01-01 10:00:04"
+    new_fact = ledger.add_fact(CODE, "2", "row 1 is the key schedule")
+    ids = [old_fact, old_result, new_result, new_fact]
+
+    owner = watcher_prompt(claude_agent.LEAD_SLOT)
+    head, rest = owner.split("[Ledger entries", 1)
+    assert "New since the last digest (2026-01-01 10:00:02)" in head
+    assert _rows(head, ids) == [new_result, new_fact]
+    assert sorted(_rows(rest, ids)) == sorted([old_fact, old_result])
+    assert "ids it rests on" in owner
+
+    other = watcher_prompt("2")
+    assert "New since the last digest" not in other and "ids it rests on" not in other
+    assert _rows(other, ids) == [old_fact, new_fact, old_result, new_result]

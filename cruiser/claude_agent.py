@@ -157,6 +157,7 @@ _WATCHER_SYSTEM = (
 )
 
 _WATCHER_PROMPT_TEMPLATE = (
+    "{new_since}"
     "[Ledger entries (id status author content)]\n{blackboard}\n\n"
     "[Directed task results (id status author direction -> conclusion)]\n{results}\n\n"
     "[Exploration directions currently waiting to be claimed]\n{tasks}\n"
@@ -166,6 +167,8 @@ _WATCHER_PROMPT_TEMPLATE = (
     "Rules:\n"
     "1. add: new, reusable concrete facts or leads (addresses, constants, parameters, files, candidate values, verified methods, artifact file paths, etc.); "
     "write ones that have a concrete value but are not yet confirmed as \"lead: ...\"; at most 120 characters each, at most 3 per call; do not repeat what the ledger already has; "
+    "an item is a string or {{\"text\": \"...\", \"basis_ids\": [\"ids of the entries it was derived from\"], \"confidence\": \"observed\" or \"inferred\"}} "
+    "(observed = seen directly in the activity, inferred = concluded but not seen); "
     "do not record basic information such as server fingerprints or version numbers (unless tied to a specific vulnerability); do not hard-code concrete IP:port (it changes when the container restarts), write endpoints only as relative paths or logical names; "
     "[Never write concrete flag values] never write flag{{...}}, FLAG{{...}} or any other flag-like string;\n"
     "2. verify: ids of entries or task results (f-... / r-...) reproduced or confirmed by replay in the recent activity;\n"
@@ -176,17 +179,23 @@ _WATCHER_PROMPT_TEMPLATE = (
     "goal and success criteria / verified conclusions / open leads (list every concrete-value lead and open question not yet conclusively refuted, including disputed entries)"
     " / key artifacts (file paths) / next integration actions (which known conclusions combined can advance to the flag); at most 2000 characters; "
     "return an empty string when there is no substantive change from the current digest;\n"
-    "6. suggest_tasks: [{{\"text\": \"a one-sentence actionable direction\", \"basis\": \"the corresponding open lead or entry id\"}}]; "
+    "6. suggest_tasks: [{{\"text\": \"a one-sentence actionable direction\", \"basis_ids\": [\"ids of the open leads or entries it follows from\"]}}]; "
     "do not publish directions unrelated to the open items in the digest; if the challenge hint gives ordered steps, a direction must map to one of those steps; "
     "do not repeat ones already pending or in progress; at most 2 per call;\n"
     "7. retire_tasks: ids (t-xxxxxx) of pending directions that are duplicates, already done, or unrelated to the open items;\n"
     "8. return empty for fields with no change.\n"
-    'Output strictly JSON: {{"add": [], "verify": [], "dispute": [{{"id": "", "reason": ""}}], '
+    'Output strictly JSON: {{"add": [{{"text": "", "basis_ids": [], "confidence": "observed"}}], "verify": [], "dispute": [{{"id": "", "reason": ""}}], '
     '"supersede": [{{"id": "", "new": ""}}], "digest": "", '
-    '"suggest_tasks": [{{"text": "", "basis": ""}}], "retire_tasks": []}}'
+    '"suggest_tasks": [{{"text": "", "basis_ids": []}}], "retire_tasks": []}}'
 )
 
 _WATCHER_NO_DIGEST = "\nThe solve-state digest is maintained by the lead session's watcher: always return digest as an empty string."
+_WATCHER_DIGEST_RULES = (
+    "\nDigest body rules: every conclusion ends with the ids it rests on, e.g. (f-1a2b3c, r-4d5e6f); "
+    "distinct conclusions stay distinct, never merge two into one; mark inferred claims as inferred; "
+    "add nothing that no ledger entry or task result supports."
+)
+_WATCHER_DIGEST_TAIL = {True: _WATCHER_DIGEST_RULES, False: _WATCHER_NO_DIGEST}
 
 LEAD_SLOT = "1"
 SINGLE_WORKER_ID = "single"
@@ -427,18 +436,36 @@ def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optiona
     return last_js
 
 
-def _format_ledger_for_watcher(code: str) -> tuple[str, str]:
-    """Watcher view of ledger entries and task results: (entries text, results text), keeping the newest part when over budget."""
+class WatcherView(NamedTuple):
+    new: str
+    facts: str
+    results: str
+
+
+def _format_ledger_for_watcher(code: str, since: str = "") -> WatcherView:
     from . import ledger
 
-    def _notes(e: dict) -> str:
-        return f" ({'; '.join(e['notes'])})" if e["notes"] else ""
+    def _tail(e: dict) -> str:
+        return (f" ({'; '.join(e['notes'])})" if e["notes"] else "") + ledger.basis_suffix(e["basis"])
 
-    rows = [f"- {f['id']} [{f['status']}] ({f['author']}) {'[flag-method] ' if f['kind'] == 'flag_method' else ''}{f['text']}{_notes(f)}"
-            for f in ledger.facts(code)]
-    res = [f"- {r['id']} [{r['status']}] ({r['author']}) direction '{r['task'][:80]}' -> {r['text'][:400]}{_notes(r)}"
-           for r in ledger.results(code)[-12:]]
-    return ("\n".join(rows) or "(empty)")[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
+    def _row(e: dict) -> str:
+        if e["kind"] == "result":
+            return f"- {e['id']} [{e['status']}] ({e['author']}) direction '{e['task'][:80]}' -> {e['text'][:400]}{_tail(e)}"
+        return (f"- {e['id']} [{e['status']}] {ledger.CONFIDENCE_TAG.get(e['confidence'], '')}({e['author']}) "
+                f"{'[flag-method] ' if e['kind'] == 'flag_method' else ''}{e['text']}{_tail(e)}")
+
+    def _new(e: dict) -> bool:
+        return bool(since) and e["ts"] > since
+
+    facts, results = ledger.facts(code), ledger.results(code)
+    new = sorted((e for e in facts + results if _new(e)), key=lambda e: e["ts"])
+    old_facts = [e for e in facts if not _new(e)]
+    old_results = [e for e in results if not _new(e)][-12:]
+    return WatcherView(
+        new=("\n".join(map(_row, new)) or "(none)")[-_WATCHER_BB_CHARS:],
+        facts=("\n".join(map(_row, old_facts)) or "(empty)")[-_WATCHER_BB_CHARS:],
+        results=("\n".join(map(_row, old_results)) or "(empty)")[-_WATCHER_TASKS_CHARS:],
+    )
 
 
 class Dispute(NamedTuple):
@@ -451,14 +478,25 @@ class Supersede(NamedTuple):
     new_text: str
 
 
+class NewFact(NamedTuple):
+    text: str
+    basis: tuple[str, ...] = ()
+    confidence: Optional[str] = None
+
+
+class Direction(NamedTuple):
+    text: str
+    basis_ids: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class WatcherReply:
-    add: tuple[str, ...] = ()
+    add: tuple[NewFact, ...] = ()
     verify: tuple[str, ...] = ()
     dispute: tuple[Dispute, ...] = ()
     supersede: tuple[Supersede, ...] = ()
     digest: str = ""
-    suggest_tasks: tuple[str, ...] = ()
+    suggest_tasks: tuple[Direction, ...] = ()
     retire_tasks: tuple[str, ...] = ()
 
 
@@ -473,11 +511,17 @@ def _id_pair(item, field: str) -> Optional[tuple[str, str]]:
     return (eid, value) if eid and value else None
 
 
-def _task_line(item) -> str:
-    if not isinstance(item, dict):
-        return _str(item)
-    text, basis = _str(item.get("text")), _str(item.get("basis"))
-    return f"{text} (basis: {basis})" if text and basis else text
+def _text_item(item) -> tuple[str, dict]:
+    return (_str(item.get("text")), item) if isinstance(item, dict) else (_str(item), {})
+
+
+def _ids(v) -> tuple[str, ...]:
+    return tuple(i for i in map(_str, v) if i) if isinstance(v, list) else ()
+
+
+def _confidence(v) -> Optional[str]:
+    from . import ledger
+    return v if isinstance(v, str) and v in ledger.CONFIDENCE_TAG else None
 
 
 def parse_watcher_reply(content: str, *, owns_digest: bool) -> Optional[WatcherReply]:
@@ -499,14 +543,16 @@ def parse_watcher_reply(content: str, *, owns_digest: bool) -> Optional[WatcherR
     def _pairs(key: str, field: str) -> list[tuple[str, str]]:
         return [p for p in (_id_pair(d, field) for d in _list(key)) if p]
 
-    add = [t for t in _strs("add") if not FLAG_RE.search(t) and not _is_flag_method(t)]
+    add = [NewFact(t, _ids(d.get("basis_ids")), _confidence(d.get("confidence")))
+           for t, d in map(_text_item, _list("add")) if t and not FLAG_RE.search(t) and not _is_flag_method(t)]
+    tasks = [Direction(t, _ids(d.get("basis_ids"))) for t, d in map(_text_item, _list("suggest_tasks")) if t]
     return WatcherReply(
         add=tuple(add[:3]),
         verify=tuple(_strs("verify")[:5]),
         dispute=tuple(Dispute(*p) for p in _pairs("dispute", "reason")[:3]),
         supersede=tuple(Supersede(*p) for p in _pairs("supersede", "new")[:3]),
         digest=_str(obj.get("digest")) if owns_digest else "",
-        suggest_tasks=tuple([t for t in map(_task_line, _list("suggest_tasks")) if t][:2]),
+        suggest_tasks=tuple(tasks[:2]),
         retire_tasks=tuple(_strs("retire_tasks")[:3]),
     )
 
@@ -515,12 +561,13 @@ def _apply_watcher_reply(code: str, worker_id: str, reply: WatcherReply) -> dict
     from . import ledger
     from .taskboard import publish_task, retire_task
     return {
-        "added": sum(ledger.add_fact(code, worker_id, t) is not None for t in reply.add),
+        "added": sum(ledger.add_fact(code, worker_id, f.text, basis=f.basis, confidence=f.confidence) is not None
+                     for f in reply.add),
         "verified": sum(ledger.set_status(code, i, "verified", by=worker_id) for i in reply.verify),
         "disputed": sum(ledger.set_status(code, i, "disputed", why, worker_id) for i, why in reply.dispute),
         "superseded": sum(ledger.supersede(code, i, new, worker_id) is not None for i, new in reply.supersede),
         "digest": int(bool(reply.digest) and ledger.set_digest(code, worker_id, reply.digest)),
-        "published": sum(publish_task(code, t) for t in reply.suggest_tasks),
+        "published": sum(publish_task(code, d.text, d.basis_ids) for d in reply.suggest_tasks),
         "retired": sum(retire_task(code, r) for r in reply.retire_tasks),
     }
 
@@ -536,7 +583,8 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir:
         if llm is None:
             return
         owns_digest = _owns_digest(worker_id)
-        facts_text, results_text = _format_ledger_for_watcher(code)
+        since = ledger.digest_ts(code) if owns_digest else ""
+        view = _format_ledger_for_watcher(code, since)
         pending_tasks = list_tasks(code)
         claimed_tasks = list_claimed(code)
         tasks_text = "\n".join(f"- [{t['id']}] {t['text']}" for t in pending_tasks) or "(empty)"
@@ -545,14 +593,14 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir:
             _WATCHER_PROMPT_TEMPLATE
             .replace("{{", "{").replace("}}", "}")
             .replace("{activity}", activity[-_WATCHER_ACTIVITY_CHARS:])
-            .replace("{blackboard}", facts_text)
-            .replace("{results}", results_text)
+            .replace("{blackboard}", view.facts)
+            .replace("{results}", view.results)
             .replace("{digest}", ledger.digest(code) or "(none yet)")
             .replace("{tasks}", tasks_text[-_WATCHER_TASKS_CHARS:])
             .replace("{claimed_tasks}", claimed_text[-_WATCHER_CLAIMED_CHARS:])
+            .replace("{new_since}", f"[New since the last digest ({since})]\n{view.new}\n\n" if since else "")
         )
-        if not owns_digest:
-            prompt += _WATCHER_NO_DIGEST
+        prompt += _WATCHER_DIGEST_TAIL[owns_digest]
         # challenge description + hint (if fetched): lets the watcher use them to maintain the ledger and publish better-fitting exploration directions
         reports_dir = os.path.join(os.getcwd(), "reports")
         context_header = ""

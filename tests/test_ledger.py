@@ -67,9 +67,25 @@ def test_context_text_puts_digest_first_and_respects_budget(reports):
         ledger.add_fact("T-1", "1", f"entry number {i} " + "x" * 40)
     ledger.set_digest("T-1", "w", "GOAL: get DH{...}\nOPEN LEADS: seed candidate")
     text = ledger.context_text("T-1", budget=1500)
-    assert text.startswith("[Solve state")
+    assert text.splitlines()[0].startswith("[Ledger] 200 live entries")
+    assert text.splitlines()[1].startswith("[Solve state")
     assert len(text) <= 1500
     assert "entry number 199" in text and "entry number 0 " not in text
+
+
+def test_context_text_starts_with_ledger_totals_inside_the_budget(reports):
+    fids = [ledger.add_fact("T-1", "1", f"fact number {i} " + "x" * 30) for i in range(120)]
+    for i in range(60):
+        ledger.add_result("T-1", f"solver{i}", f"direction {i}", f"result number {i} " + "y" * 30)
+    ledger.supersede("T-1", fids[0], "fact number 1 " + "x" * 30, "w")
+    ledger.supersede("T-1", fids[2], "fact number 3 " + "x" * 30, "w")
+    ledger.set_digest("T-1", "w", "GOAL: get DH{...}\nOPEN LEADS: " + "z" * 900)
+    text = ledger.context_text("T-1", budget=3000)
+    shown = [ln for ln in text.splitlines() if ln.startswith("- ")]
+    assert text.splitlines()[0] == (f"[Ledger] 178 live entries (118 facts, 60 task results), {len(shown)} shown newest first;"
+                                    " full list: reports/info_T-1.txt")
+    assert 0 < len(shown) < 178 and "result number 59 " in shown[-1]
+    assert len(text) <= 3000
 
 
 def _writer(path: str, n: int, tag: str) -> None:
@@ -194,7 +210,7 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
         "dispute": [{"id": lead, "reason": "not the seed of the solved grid"}],
         "supersede": [],
         "digest": "GOAL: DH{...}\nOPEN LEADS: f-lead seed",
-        "suggest_tasks": [{"text": "derive the output from the seed lead", "basis": lead}],
+        "suggest_tasks": [{"text": "derive the output from the seed lead", "basis_ids": [lead]}],
         "retire_tasks": [],
     }
 
@@ -213,4 +229,76 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
     assert "grid columns 0-3 are [1, 2, 3, 4]" in texts
     assert not any("should_never_be_stored_here" in t for t in texts)
     assert ledger.digest("T-1").startswith("GOAL")
-    assert any(lead in t["text"] for t in taskboard.list_tasks("T-1"))
+    assert [t["basis_ids"] for t in taskboard.list_tasks("T-1")] == [[lead]]
+
+
+def _codex_cmds(monkeypatch) -> dict[str, list[str]]:
+    captured = {}
+    monkeypatch.setattr(codex_engine, "binary", lambda: "codex")
+    monkeypatch.setattr(codex_engine.subprocess, "run", lambda cmd, **kw: captured.setdefault("cmd", cmd) and None)
+    codex_engine.WatcherLLM("/w").invoke(["review"])
+    return {
+        "session": codex_engine.session_cmd("go", "sys", "", ws_dir="/w", reports_dir="/r"),
+        "resume": codex_engine.resume_cmd("tid", "go on", ws_dir="/w", reports_dir="/r"),
+        "watcher": captured["cmd"],
+    }
+
+
+def test_codex_defaults_to_gpt_6_sol_with_daybreak_on_every_call(monkeypatch):
+    for name in ("CRUISER_CODEX_MODEL", "CRUISER_CODEX_WATCHER_MODEL", "CRUISER_CODEX_DAYBREAK"):
+        monkeypatch.delenv(name, raising=False)
+    for role, cmd in _codex_cmds(monkeypatch).items():
+        assert cmd[cmd.index("-m") + 1] == "gpt-6-sol", role
+        assert "daybreak=true" in cmd, role
+    monkeypatch.setenv("CRUISER_CODEX_DAYBREAK", "0")
+    for role, cmd in _codex_cmds(monkeypatch).items():
+        assert "daybreak=true" not in cmd, role
+
+
+def _board_line(reports, entry_id: str) -> str:
+    board = (reports / "info_T-1.txt").read_text(encoding="utf-8")
+    return next(ln for ln in board.splitlines() if f" {entry_id} " in ln)
+
+
+def test_basis_keeps_only_ids_of_live_entries(reports):
+    known = ledger.add_fact("T-1", "1", "admin cookie is base64 json")
+    old = ledger.add_fact("T-1", "1", "key is 16 bytes")
+    ledger.supersede("T-1", old, "key is 16 bytes, big-endian", "2")
+    rid = ledger.add_result("T-1", "solver1", "forge the cookie", "forged admin cookie accepted",
+                            basis=[known, "f-unknwn", old, known])
+    [r] = ledger.results("T-1")
+    assert r["id"] == rid and r["basis"] == [known]
+    assert _board_line(reports, rid).endswith(f" (from {known})")
+    plain = ledger.add_fact("T-1", "1", "login form posts to /auth", basis=["f-unknwn"])
+    assert next(f for f in ledger.facts("T-1") if f["id"] == plain)["basis"] == []
+    assert "(from" not in _board_line(reports, plain)
+
+
+def test_inferred_fact_is_tagged_after_its_status(reports):
+    inferred = ledger.add_fact("T-1", "1", "the PRNG is seeded from the table", confidence="inferred")
+    observed = ledger.add_fact("T-1", "1", "the table has 256 rows", confidence="observed")
+    ledger.set_status("T-1", inferred, "verified", by="2")
+    assert f"[verified] [inferred] {inferred} " in _board_line(reports, inferred)
+    assert "[inferred]" not in _board_line(reports, observed) and "[observed]" not in _board_line(reports, observed)
+    assert {f["id"]: f["confidence"] for f in ledger.facts("T-1")} == {inferred: "inferred", observed: "observed"}
+
+
+@pytest.mark.parametrize("status", ["open", "verified", "disputed"])
+def test_dashboard_classifies_every_kind_with_basis_and_confidence(reports, status):
+    expected = {"fact": "fact", "flag_method": "flag_method", "result": "task_report"}
+    base = ledger.add_fact("T-1", "1", "base fact for basis")
+    ids = {}
+    for kind in ("fact", "flag_method"):
+        for i, (basis, confidence) in enumerate([([], None), ([base], None), ([base], "inferred"), ([], "observed")]):
+            ids[ledger.add_fact("T-1", "1", f"progress {len(ids) + 1}/9. {kind} variant {i}", kind=kind,
+                                basis=basis, confidence=confidence)] = kind
+    for i, basis in enumerate([[], [base]]):
+        ids[ledger.add_result("T-1", "solver1", f"direction {i}", f"result variant {i}", basis=basis)] = "result"
+    if status != "open":
+        for eid in ids:
+            ledger.set_status("T-1", eid, status, f"{status} by replay", "2")
+    entries = runtime.parse_blackboard((reports / "info_T-1.txt").read_text(encoding="utf-8"))
+    assert len(entries) == len(ids) + 1
+    for eid, kind in ids.items():
+        [e] = [e for e in entries if eid in e["info"].split()]
+        assert e["kind"] == expected[kind], e["info"]
