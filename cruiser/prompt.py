@@ -266,6 +266,9 @@ CLAUDE_SOLVER_TASK_TEMPLATE = (
     "3. [Multiple flags] Look at \"flag progress X/Y\" in the response: X<Y means there are still flags you have not obtained; do not stop, keep looking for the remaining flags;"
     "only when X==Y output a single line {{\"flag\":\"content of the last flag\"}} and stop;\n"
     "4. If a submission is wrong, do not resubmit the same one.\n\n"
+    "[Report your conclusion (required)]\n"
+    "Before you stop, record the conclusion of this direction once: what you tried, what holds or does not, and the concrete values you found (never a flag value):\n"
+    "{report_cmd} '<conclusion>'\n\n"
     "[How to find the flag (important)]\n"
     "If you obtain command execution or arbitrary file read while working on this direction, read {res_dir}/flag_hunting.txt before searching for the flag;"
     "if the flag is not in the usual locations, check /proc/self/environ, /proc/1/environ, env/printenv, /proc/mounts, /proc/self/mountinfo and similar locations;"
@@ -280,5 +283,5 @@ CLAUDE_SOLVER_TASK_TEMPLATE = (
     "Directory scan script: {dirsearch_cmd} <url> (deduplicated across sessions, -i 200,301,302 built in; use it instead of running dirsearch directly)\n"
     "Binary decompilation script: {decompile_script} (usage: python3 {decompile_script} <binary> [function-name|--all] [--no-asm];"
     " the output includes 'Data references'; entries marked 'no' = data is read but has no corresponding expression in the pseudocode, usually because the computation was eliminated as dead code; infer it from the disassembly)\n"
-    "The current directory is your workspace. Focus on completing the one direction above; stop when it is done or confirmed infeasible. Start now.\n"
+    "The current directory is your workspace. Focus on completing the one direction above; when it is done or confirmed infeasible, report your conclusion and stop. Start now.\n"
 )

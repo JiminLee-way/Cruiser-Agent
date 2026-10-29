@@ -7,7 +7,7 @@ import multiprocessing as mp
 
 import pytest
 
-from cruiser import codex_engine, ledger, opencode_engine
+from cruiser import codex_engine, ledger, opencode_engine, runtime
 
 
 @pytest.fixture
@@ -66,15 +66,68 @@ def _writer(path: str, n: int, tag: str) -> None:
         lg.add_fact("T-1", tag, f"{tag} fact {i}")
 
 
-def test_concurrent_writers_do_not_lose_entries(reports):
-    procs = [mp.Process(target=_writer, args=(str(reports), 15, f"w{k}")) for k in range(4)]
+def _run_all(procs: list) -> None:
     for p in procs:
         p.start()
     for p in procs:
         p.join(30)
+    assert [p.exitcode for p in procs] == [0] * len(procs)
+
+
+def test_concurrent_writers_do_not_lose_entries(reports):
+    _run_all([mp.Process(target=_writer, args=(str(reports), 15, f"w{k}")) for k in range(4)])
     assert len(ledger.facts("T-1")) == 60
-    raw = (reports / "ledger_T-1.jsonl").read_text(encoding="utf-8").splitlines()
-    assert all(json.loads(x) for x in raw)
+    assert {f["text"] for f in ledger.facts("T-1")} == {f"w{k} fact {i}" for k in range(4) for i in range(15)}
+
+
+def _same_text_writer(path: str, n: int) -> None:
+    from cruiser import ledger as lg
+    lg._reports_dir = lambda: path
+    for i in range(n):
+        lg.add_fact("T-1", "w", f"shared fact {i}")
+
+
+def test_concurrent_writers_store_the_same_text_once(reports):
+    _run_all([mp.Process(target=_same_text_writer, args=(str(reports), 20)) for _ in range(4)])
+    assert sorted(f["text"] for f in ledger.facts("T-1")) == sorted(f"shared fact {i}" for i in range(20))
+
+
+def _stored_bytes(d) -> int:
+    return sum(p.stat().st_size for p in d.iterdir() if p.is_file())
+
+
+def test_repeated_digests_do_not_grow_stored_state(reports):
+    ledger.add_fact("T-1", "1", "fact one")
+    ledger.set_digest("T-1", "1", "GOAL: 000")
+    before = _stored_bytes(reports)
+    for i in range(1, 50):
+        ledger.set_digest("T-1", "1", f"GOAL: {i:03d}")
+    assert ledger.digest("T-1") == "GOAL: 049"
+    assert _stored_bytes(reports) == before
+
+
+def test_dashboard_classifies_every_rendered_kind(reports):
+    ledger.add_fact("T-1", "1", "plain fact")
+    ledger.add_fact("T-1", "1", "progress 1/1. sqli on /login", kind="flag_method")
+    rid = ledger.add_result("T-1", "solver1", "check the table", "the table is a UI legend")
+    ledger.set_status("T-1", rid, "disputed", "the table seeds the PRNG", "2")
+    entries = runtime.parse_blackboard((reports / "info_T-1.txt").read_text(encoding="utf-8"))
+    assert [(e["worker"], e["kind"]) for e in entries] == [
+        ("1", "fact"), ("1", "flag_method"), ("solver1", "task_report"),
+    ]
+
+
+def test_unreadable_ledger_still_starts_sessions_but_is_never_overwritten(reports, capsys):
+    (reports / "desc_T-1.txt").write_text("find the admin panel", encoding="utf-8")
+    path = reports / "ledger_T-1.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert opencode_engine.context_block(str(reports), "T-1") == "[Challenge description]\nfind the admin panel"
+    captured = capsys.readouterr()
+    [warning] = [ln for ln in (captured.out + captured.err).splitlines() if ln.startswith("[Ledger]")]
+    assert str(path) in warning
+    with pytest.raises(ValueError):
+        ledger.add_fact("T-1", "1", "a fact written after the corruption")
+    assert path.read_text(encoding="utf-8") == "{not json"
 
 
 def test_session_slots(reports):
@@ -102,19 +155,25 @@ def test_codex_resume_cmd(monkeypatch):
     assert json.loads(roots.split("=", 1)[1]) == ["/root", "/r", "/w"]
 
 
-def test_engines_announce_session_ids():
+def test_engines_announce_session_ids(monkeypatch):
     codex_out = io.StringIO('{"type":"thread.started","thread_id":"t-1"}\n{"type":"turn.completed"}\n')
     first = next(iter(codex_engine.claude_events(codex_out)))
     assert first == {"type": "system", "subtype": "init", "session_id": "t-1"}
     oc_out = io.StringIO('{"type":"text","sessionID":"ses_1","part":{"text":"hi"}}\n')
     evs = list(opencode_engine.claude_events(oc_out))
     assert evs[0]["session_id"] == "ses_1" and evs[1]["type"] == "assistant"
-    assert opencode_engine.resume_cmd.__name__ and "--session" in opencode_engine._run_cmd("m", "x", "ses_1")
+    monkeypatch.setattr(opencode_engine, "binary", lambda: "opencode")
+    cmd = opencode_engine.resume_cmd("ses_1", "go on", model="m")
+    assert cmd[cmd.index("--session") + 1] == "ses_1" and cmd[-1] == "go on"
 
 
-def test_watcher_applies_statuses_by_id_and_never_deletes(reports, monkeypatch):
+def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, monkeypatch):
     from cruiser import claude_agent, taskboard
     monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
+    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     lead = ledger.add_fact("T-1", "solver11", "lead: seed 0xab5e313b gives the known prefix")
     keep = ledger.add_fact("T-1", "1", "bytecode is 2200 records of 8 bytes")
     reply = {
@@ -134,7 +193,7 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, monkeypatch):
             return R()
 
     monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
-    claude_agent._watcher_curate_blackboard("T-1", "w1", "Thought: tried things\nAction: shell: ls")
+    claude_agent._watcher_curate_blackboard("T-1", claude_agent.LEAD_SLOT, "Thought: tried things\nAction: shell: ls")
     by_id = {f["id"]: f for f in ledger.facts("T-1")}
     assert by_id[lead]["status"] == "disputed" and "0xab5e313b" in by_id[lead]["text"]
     assert by_id[keep]["status"] == "verified"

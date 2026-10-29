@@ -62,8 +62,7 @@ Cruiser/
 │   ├── dashboard.py         # Dashboard HTTP: snapshot / blackboard / task board / logs
 │   ├── runtime.py           # Scheduler runtime snapshot (read by the dashboard)
 │   ├── prompt.py            # System prompts and task templates
-│   ├── tools.py             # submit_flag, dirsearch/xss and other tools
-│   └── agent.py             # Legacy hand-written ReAct engine (deprecated, kept for reference)
+│   └── tools.py             # submit_flag, dirsearch/xss and other tools
 ├── resource/                # Username/password/XSS payload wordlists
 ├── kb/                      # Offline vulnerability knowledge base (git submodules: vulhub / nuclei-templates / PayloadsAllTheThings; download the nuclei binary yourself)
 ├── tests/                   # pytest tests (local platform, flag submission, scheduler smoke test)

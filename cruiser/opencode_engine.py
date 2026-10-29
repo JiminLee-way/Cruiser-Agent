@@ -140,12 +140,13 @@ class OpencodeLLM:
         self.timeout_s = timeout_s
 
     def invoke(self, messages) -> _Reply:
+        from .engines import child_env
         prompt = "\n\n".join(str(getattr(m, "content", m)) for m in messages)
         cmd = [binary(), "run", "--standalone", "--format", "json", "-m", self.model, prompt]
+        cwd = os.environ.get("CRUISER_WORKSPACE_DIR") or os.getcwd()
         try:
             out = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.timeout_s,
-                cwd=os.environ.get("CRUISER_WORKSPACE_DIR") or None,
+                cmd, capture_output=True, text=True, timeout=self.timeout_s, cwd=cwd, env=child_env(cwd),
             ).stdout
         except Exception:
             return _Reply("")
