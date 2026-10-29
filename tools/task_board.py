@@ -4,7 +4,9 @@
 Usage:
     python tools/task_board.py list <code>                        # list directions waiting to be claimed
     python tools/task_board.py claim <code> <worker_id> [task_id] # claim (claiming erases it; without an id, claims the first one)
-    python tools/task_board.py report <code> <worker_id> <result>   # report the outcome (written to the shared blackboard)
+    python tools/task_board.py report <code> <worker_id> <result> [--basis f-a,r-b]
+                                                    # report the outcome (written to the shared blackboard),
+                                                    # optionally naming the blackboard entry ids it rests on
 
 On a successful claim, prints the direction and exits with code 0; exits with code 3 when there is nothing to claim.
 """
@@ -18,7 +20,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cruiser.taskboard import claim_task, list_tasks, report_task
 
 
+def _pop_basis(args: list[str]) -> list[str]:
+    if "--basis" not in args:
+        return []
+    i = args.index("--basis")
+    value = args[i + 1] if i + 1 < len(args) else ""
+    del args[i: i + 2]
+    return [b.strip() for b in value.split(",") if b.strip()]
+
+
 def main() -> int:
+    basis = _pop_basis(sys.argv)
     if len(sys.argv) < 3:
         print(__doc__)
         return 2
@@ -54,11 +66,11 @@ def main() -> int:
 
     if action == "report":
         if len(sys.argv) < 5:
-            print("Usage: python tools/task_board.py report <code> <worker_id> <outcome>")
+            print("Usage: python tools/task_board.py report <code> <worker_id> <outcome> [--basis f-a,r-b]")
             return 2
         worker_id = sys.argv[3]
         text = sys.argv[4]
-        if report_task(code, worker_id, text):
+        if report_task(code, worker_id, text, basis=basis):
             print("reported; the result has been shared to the blackboard")
             return 0
         return 1

@@ -199,9 +199,9 @@ def retire_task(code: str, task_id: str) -> bool:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def report_task(code: str, worker_id: str, text: str, task: str = "") -> bool:
+def report_task(code: str, worker_id: str, text: str, task: str = "", basis: tuple[str, ...] | list[str] = ()) -> bool:
     from . import ledger
     if not task:
         mine = [c["text"] for c in list_claimed(code) if c["worker"] == worker_id]
         task = mine[-1] if mine else ""
-    return ledger.add_result(code, worker_id, task, text) is not None
+    return ledger.add_result(code, worker_id, task, text, basis=basis) is not None

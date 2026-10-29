@@ -132,3 +132,20 @@ def test_watcher_retires_a_direction_only_by_its_exact_id(reports, run_watcher):
     assert set(t["id"] for t in taskboard.list_tasks(CODE)) == set(by_text.values())
     run_watcher("2", {"retire_tasks": [by_text["brute force the admin login"]]})
     assert [t["id"] for t in taskboard.list_tasks(CODE)] == [by_text["read the backup archive"]]
+
+
+def test_report_cli_passes_basis_ids_to_the_ledger(repo_copy, monkeypatch):
+    import subprocess
+    import sys
+
+    from conftest import subprocess_env
+    monkeypatch.setattr(ledger, "_reports_dir", lambda: str(repo_copy / "reports"))
+    known = ledger.add_fact(CODE, "1", "admin cookie is base64 json")
+    out = subprocess.run(
+        [sys.executable, "tools/task_board.py", "report", CODE, "solver1", "forged admin cookie accepted",
+         "--basis", f"{known},f-unknwn"],
+        cwd=repo_copy, env=subprocess_env(), capture_output=True, text=True, timeout=30,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    [r] = ledger.results(CODE)
+    assert (r["text"], r["basis"]) == ("forged admin cookie accepted", [known])
