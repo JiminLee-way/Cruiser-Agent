@@ -73,8 +73,7 @@ def test_concurrent_writers_do_not_lose_entries(reports):
     for p in procs:
         p.join(30)
     assert len(ledger.facts("T-1")) == 60
-    raw = (reports / "ledger_T-1.jsonl").read_text(encoding="utf-8").splitlines()
-    assert all(json.loads(x) for x in raw)
+    assert {f["text"] for f in ledger.facts("T-1")} == {f"w{k} fact {i}" for k in range(4) for i in range(15)}
 
 
 def test_session_slots(reports):

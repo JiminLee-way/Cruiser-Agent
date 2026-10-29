@@ -218,23 +218,11 @@ def _format_watcher_activity(recent: deque[str] | list[str], budget: int = _WATC
     return text[-budget:] if len(text) > budget else text
 
 
+_FLAG_METHOD_TAG = "[flag-method]"
+
+
 def _is_flag_method(info: str) -> bool:
-    return (info or "").lstrip().startswith("[flag-method]")
-
-
-def _flag_method_key(info: str) -> str:
-    """Key of the method entry for one flag ('1', '2', ...). Empty string if it cannot be determined."""
-    text = info or ""
-    m = re.search(r"progress\s*(\d+)\s*/\s*\d+", text)
-    if m:
-        return m.group(1)
-    m = re.search(r"(?:flag|FLAG)\s*(\d+)", text)
-    if m:
-        return m.group(1)
-    m = re.search(r"第\s*(\d+)\s*[枚个份]", text)
-    if m:
-        return m.group(1)
-    return ""
+    return (info or "").lstrip().startswith(_FLAG_METHOD_TAG)
 
 
 def _flag_method_dbg(msg: str) -> None:
@@ -245,23 +233,16 @@ def _flag_method_dbg(msg: str) -> None:
 
 
 def _append_blackboard_info(code: str, worker_id: str, info: str) -> bool:
-    """Append an entry to the shared ledger ([flag-method] is written only once per progress key). Returns True if written."""
+    """Write a [flag-method] line to the shared ledger, which keeps one per flag. Returns True if written."""
     from . import ledger
     info = (info or "").strip()
     if not code or not info:
         _flag_method_dbg(f"append rejected: code={code!r} info_empty={not info} worker={worker_id}")
         return False
     try:
-        kind = "flag_method" if _is_flag_method(info) else "fact"
-        if kind == "flag_method":
-            key = _flag_method_key(info)
-            if key and any(
-                f["kind"] == "flag_method" and _flag_method_key(f["text"]) == key for f in ledger.facts(code)
-            ):
-                _flag_method_dbg(f"append skipped: a [flag-method] already exists for progress key={key}")
-                return False
-        fid = ledger.add_fact(code, worker_id, info, kind=kind)
-        _flag_method_dbg(f"append result id={fid} worker={worker_id} kind={kind}")
+        body = info[len(_FLAG_METHOD_TAG):] if _is_flag_method(info) else info
+        fid = ledger.add_fact(code, worker_id, body, kind="flag_method")
+        _flag_method_dbg(f"append result id={fid} worker={worker_id}")
         return fid is not None
     except Exception as e:
         _flag_method_dbg(f"append error err={type(e).__name__}: {e}")
@@ -432,7 +413,7 @@ def _format_ledger_for_watcher(code: str) -> tuple[str, str]:
         note = f" ({'; '.join(f['notes'])})" if f["notes"] else ""
         rows.append(f"- {f['id']} [{status_tag.get(f['status'], f['status'])}] ({f['author']}) {f['text']}{note}")
     res = [f"- {r.get('id')} ({r.get('author')}) direction '{r.get('task', '')[:80]}' -> {r.get('text', '')[:400]}"
-           for r in ledger.results(code, limit=12)]
+           for r in ledger.results(code)[-12:]]
     facts_text = "\n".join(rows) or "(empty)"
     return facts_text[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
 
