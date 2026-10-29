@@ -22,14 +22,23 @@ def test_child_started_with_child_env_sees_its_cwd_as_pwd(tmp_path):
     assert out == str(ws)
 
 
-def test_explorer_slots_keep_their_workspace_and_solvers_get_fresh_ones(tmp_path, monkeypatch):
+def test_explorer_slots_keep_their_workspace_within_a_run_and_solvers_get_fresh_ones(tmp_path, monkeypatch):
     monkeypatch.setenv("CRUISER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.setenv("CRUISER_RUN_ID", "run-a")
     first = claude_agent.workspace_dir("T-1", "1", resumable=True)
     assert claude_agent.workspace_dir("T-1", "1", resumable=True) == first
     assert claude_agent.workspace_dir("T-1", "2", resumable=True) != first
     solvers = {claude_agent.workspace_dir("T-1", "solver1", resumable=False) for _ in range(2)}
     assert len(solvers) == 2
     assert all(os.path.isdir(p) for p in solvers | {first})
+
+
+def test_a_new_run_never_reuses_an_earlier_runs_explorer_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRUISER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.setenv("CRUISER_RUN_ID", "run-a")
+    earlier = claude_agent.workspace_dir("T-1", "1", resumable=True)
+    monkeypatch.setenv("CRUISER_RUN_ID", "run-b")
+    assert claude_agent.workspace_dir("T-1", "1", resumable=True) != earlier
 
 
 STUB = textwrap.dedent('''\

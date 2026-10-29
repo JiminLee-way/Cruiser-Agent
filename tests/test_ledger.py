@@ -117,6 +117,19 @@ def test_dashboard_classifies_every_rendered_kind(reports):
     ]
 
 
+def test_unreadable_ledger_still_starts_sessions_but_is_never_overwritten(reports, capsys):
+    (reports / "desc_T-1.txt").write_text("find the admin panel", encoding="utf-8")
+    path = reports / "ledger_T-1.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert opencode_engine.context_block(str(reports), "T-1") == "[Challenge description]\nfind the admin panel"
+    captured = capsys.readouterr()
+    [warning] = [ln for ln in (captured.out + captured.err).splitlines() if ln.startswith("[Ledger]")]
+    assert str(path) in warning
+    with pytest.raises(ValueError):
+        ledger.add_fact("T-1", "1", "a fact written after the corruption")
+    assert path.read_text(encoding="utf-8") == "{not json"
+
+
 def test_session_slots(reports):
     assert ledger.session_get("T-1", "1") is None
     ledger.session_set("T-1", "1", "codex", "thread-a")
