@@ -18,8 +18,7 @@ from typing import Any, Optional, Tuple
 #   - deepseek：解题引擎(claude CLI) 与 watcher 默认；
 #   - kimi(moonshot)：worker/watcher 指定 kimi-* 模型时自动路由；
 #   - glm(腾讯 TokenHub)：worker/watcher 指定 glm-* 模型时自动路由。
-#     默认走比赛内网网关（tokenhub.tencentmaas.com.tsecbench.gw），--local 切回
-#     TokenHub 公网 https 端点；亦可用 GLM_ANTHROPIC_BASE_URL / GLM_BASE_URL 覆盖。
+#   端点默认为各家官方 https 地址，均可用对应 *_BASE_URL 环境变量覆盖。
 # ---------------------------------------------------------------------------
 
 # 默认模型（可分别用环境变量覆盖）
@@ -36,36 +35,18 @@ class ProviderConfig:
     openai_base_url: str          # OpenAI 兼容端点默认地址（langchain watcher 用）
     anthropic_base_url_env: str   # 覆盖 Anthropic 端点的环境变量名
     openai_base_url_env: str      # 覆盖 OpenAI 端点的环境变量名
-    anthropic_base_url_local: str = ""  # 本地测试端点（--local / CRUISER_LOCAL=1 时用；原始官方域名）
-    openai_base_url_local: str = ""     # 同上（OpenAI 兼容）
     max_context_tokens: int = 1_000_000    # 模型真实上下文窗口（供 claude CLI 校正 auto-compact）
     auto_compact_window: int = 800_000     # 提前触发上下文压缩的阈值
 
 
-def _local_mode() -> bool:
-    """本地测试模式：走原始官方 https 域名而非比赛内网 .tsecbench.gw 域名。
-    由 main.py 的 --local 参数设置 CRUISER_LOCAL=1 开启。"""
-    return (os.environ.get("CRUISER_LOCAL", "") or "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def _resolve_anthropic_base_url(cfg: "ProviderConfig") -> str:
-    """Anthropic 端点解析：显式环境变量覆盖 > 本地模式原域名 > 默认(比赛内网)域名。"""
-    override = os.environ.get(cfg.anthropic_base_url_env)
-    if override:
-        return override
-    if _local_mode() and cfg.anthropic_base_url_local:
-        return cfg.anthropic_base_url_local
-    return cfg.anthropic_base_url
+    """Anthropic 端点解析：显式环境变量覆盖 > 默认官方端点。"""
+    return os.environ.get(cfg.anthropic_base_url_env) or cfg.anthropic_base_url
 
 
 def _resolve_openai_base_url(cfg: "ProviderConfig") -> str:
-    """OpenAI 兼容端点解析：显式环境变量覆盖 > 本地模式原域名 > 默认(比赛内网)域名。"""
-    override = os.environ.get(cfg.openai_base_url_env)
-    if override:
-        return override
-    if _local_mode() and cfg.openai_base_url_local:
-        return cfg.openai_base_url_local
-    return cfg.openai_base_url
+    """OpenAI 兼容端点解析：显式环境变量覆盖 > 默认官方端点。"""
+    return os.environ.get(cfg.openai_base_url_env) or cfg.openai_base_url
 
 
 # 提供方注册表：provider 名 -> 配置
@@ -73,23 +54,19 @@ PROVIDERS: dict[str, ProviderConfig] = {
     "deepseek": ProviderConfig(
         name="deepseek",
         api_key_env="DEEPSEEK_API_KEY",
-        anthropic_base_url="http://api.deepseek.com.tsecbench.gw/anthropic",
-        openai_base_url="http://api.deepseek.com.tsecbench.gw/v1",
+        anthropic_base_url="https://api.deepseek.com/anthropic",
+        openai_base_url="https://api.deepseek.com/v1",
         anthropic_base_url_env="ANTHROPIC_BASE_URL",
         openai_base_url_env="DEEPSEEK_BASE_URL",
-        anthropic_base_url_local="https://api.deepseek.com/anthropic",
-        openai_base_url_local="https://api.deepseek.com/v1",
     ),
     # Kimi / Moonshot（国内域名；国际站为 api.moonshot.ai，可用下列 *_env 覆盖）
     "kimi": ProviderConfig(
         name="kimi",
         api_key_env="KIMI_API_KEY",
-        anthropic_base_url="http://api.moonshot.cn.tsecbench.gw/anthropic",
-        openai_base_url="http://api.moonshot.cn.tsecbench.gw/v1",
+        anthropic_base_url="https://api.moonshot.cn/anthropic",
+        openai_base_url="https://api.moonshot.cn/v1",
         anthropic_base_url_env="KIMI_ANTHROPIC_BASE_URL",
         openai_base_url_env="KIMI_BASE_URL",
-        anthropic_base_url_local="https://api.moonshot.cn/anthropic",
-        openai_base_url_local="https://api.moonshot.cn/v1",
     ),
     # GLM（智谱）经腾讯 TokenHub 聚合网关：统一兼容 Anthropic Messages 与 OpenAI Chat 协议。
     # Anthropic 协议鉴权头为 x-api-key（与 ANTHROPIC_AUTH_TOKEN 发送方式一致）；
@@ -97,12 +74,10 @@ PROVIDERS: dict[str, ProviderConfig] = {
     "glm": ProviderConfig(
         name="glm",
         api_key_env="GLM_API_KEY",
-        anthropic_base_url="http://tokenhub.tencentmaas.com.tsecbench.gw",
-        openai_base_url="http://tokenhub.tencentmaas.com.tsecbench.gw/v1",
+        anthropic_base_url="https://tokenhub.tencentmaas.com",
+        openai_base_url="https://tokenhub.tencentmaas.com/v1",
         anthropic_base_url_env="GLM_ANTHROPIC_BASE_URL",
         openai_base_url_env="GLM_BASE_URL",
-        anthropic_base_url_local="https://tokenhub.tencentmaas.com",
-        openai_base_url_local="https://tokenhub.tencentmaas.com/v1",
         # TokenHub 文档：glm-5.3 / glm-5.2 上下文 1M、最大输出 128K，与 DeepSeek 同规格。
         # 注意 glm-5.1 / glm-5 / glm-5-turbo 仅 200K：使用这些老模型时请显式设置
         # CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000（与 AUTO_COMPACT_WINDOW 相应调低）。

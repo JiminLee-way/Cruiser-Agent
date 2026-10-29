@@ -1,10 +1,8 @@
 # 凭证与环境
 .env
-*.ovpn
 
-# vpn 配置（空目录入库，ovpn 不入库）
-vpn/*
-!vpn/.gitkeep
+# 本地题目定义（可能含明文 flag；模板见 challenges.example.yaml）
+challenges.yaml
 
 # 运行时产物（空目录入库，内容不入库）
 reports/*
@@ -20,6 +18,3 @@ __pycache__/
 # nuclei 二进制（单文件超过 GitHub 100MB 限制，见 README 下载方式）
 kb/bin/nuclei
 kb/bin/nuclei.exe
-
-# 辅助脚本（含环境相关路由，按需自备）
-connect_vpn.sh

@@ -66,7 +66,6 @@ def set_scheduler(
     inflight: int,
     worker_models: list[str],
     solver_model: str,
-    local: bool,
 ) -> None:
     with _LOCK:
         _SCHEDULER.clear()
@@ -78,7 +77,6 @@ def set_scheduler(
             "inflight": int(inflight),
             "worker_models": list(worker_models or []),
             "solver_model": solver_model or "",
-            "local": bool(local),
         })
         touch()
         _dump_runtime_unlocked()
@@ -489,7 +487,6 @@ def snapshot() -> dict[str, Any]:
     return {
         "ts": time.time(),
         "alive": _alive(heartbeat),
-        "local": bool(sched.get("local")),
         "max_active": int(sched.get("max_active") or 0),
         "inflight": int(sched.get("inflight") or running),
         "worker_models": sched.get("worker_models") or [],

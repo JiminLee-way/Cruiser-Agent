@@ -22,7 +22,7 @@ for _k in ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"):
 def _load_dotenv() -> None:
     """加载项目根目录的 .env（若存在）；不覆盖已存在的环境变量。
 
-    用于提供 BENCHMARK_BASE_URL / BENCHMARK_TOKEN 等配置，
+    用于提供 DEEPSEEK_API_KEY 等 LLM 密钥与 CRUISER_* 配置，
     保证 main.py 及其 spawn 的子进程都能拿到凭证。
     """
     try:

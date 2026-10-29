@@ -13,7 +13,6 @@ from typing import Optional, Literal, List, Dict, Any, Union
 import shutil
 import hashlib
 import time
-import random
 
 from dataclasses import dataclass
 from pydantic import BaseModel, Field
@@ -23,47 +22,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 
 import requests
-from tsec_benchmark import (
-    DuplicateSubmit,
-    InternalError,
-    ResourceUnavailable,
-    TSecBenchmark,
-    TSecConnectionError,
-    TSecError,
-)
+
+from .challenges import PlatformError, UnknownChallenge, get_platform
 
 # 控制台绿色打印（尽量兼容 Windows）
 _COLORAMA_READY = False
 
-# ---------------------------------------------------------------------------
-# tsec-benchmark SDK 客户端（进程级懒加载单例）
-# 凭证从环境变量读取：BENCHMARK_BASE_URL / BENCHMARK_TOKEN（可在 .env 配置）
-# ---------------------------------------------------------------------------
-_BENCHMARK_CLIENT: Optional[TSecBenchmark] = None
-_BENCHMARK_CLIENT_LOCK = threading.Lock()
 
-
-def get_benchmark_client() -> TSecBenchmark:
-    """获取 tsec-benchmark SDK 同步客户端（懒加载单例）。
-
-    - 首次调用时创建客户端并做 VPN 联通预检（失败抛 VpnCheckError）；
-    - SDK 内部以独立线程驱动事件循环，多线程调用安全；
-    - 进程退出时无需显式关闭（事件循环为守护线程，随进程回收）。
-    """
-    global _BENCHMARK_CLIENT
-    if _BENCHMARK_CLIENT is not None:
-        return _BENCHMARK_CLIENT
-    with _BENCHMARK_CLIENT_LOCK:
-        if _BENCHMARK_CLIENT is not None:
-            return _BENCHMARK_CLIENT
-        base_url = os.environ.get("BENCHMARK_BASE_URL", "").strip()
-        token = os.environ.get("BENCHMARK_TOKEN", "").strip()
-        if not base_url or not token:
-            raise RuntimeError("缺少 BENCHMARK_BASE_URL / BENCHMARK_TOKEN 环境变量（可在项目根目录 .env 中配置）")
-        client = TSecBenchmark(base_url=base_url, token=token)
-        client.check_vpn()  # 进入跑分流程前的 VPN 预检，失败抛 VpnCheckError
-        _BENCHMARK_CLIENT = client
-        return client
 def _ensure_color():
     global _COLORAMA_READY
     if _COLORAMA_READY:
@@ -745,25 +710,13 @@ def flags_all_collected(correct: int, total: int) -> bool:
 
 
 def query_flag_progress(code: str) -> tuple[int, int]:
-    """从 list_challenges 读取本题 (correct_flag_count, flag_count)；失败返回 (0, 0)。"""
+    """从本地平台读取本题 (已交对 flag 数, flag 总数)；失败返回 (0, 0)。"""
     if not code:
         return 0, 0
     try:
-        for ch in get_benchmark_client().list_challenges():
-            if getattr(ch, "unique_code", "") != code:
-                continue
-            try:
-                correct = int(getattr(ch, "correct_flag_count", 0) or 0)
-            except Exception:
-                correct = 0
-            try:
-                total = int(getattr(ch, "flag_count", 0) or 0)
-            except Exception:
-                total = 0
-            return correct, total
+        return get_platform().progress(code)
     except Exception:
-        pass
-    return 0, 0
+        return 0, 0
 
 
 def _progress_clause(correct: int, total: int) -> str:
@@ -806,109 +759,47 @@ def submit_flag_outcome(challenge_code: str, flag: str) -> FlagSubmitOutcome:
             return FlagSubmitOutcome(ok=True, output=out, correct=c, total=t, definitive=True)
         return FlagSubmitOutcome(ok=False, output=pre, definitive=True)
     try:
-        client = get_benchmark_client()
-    except Exception as e:
-        _print_color(f"[SUBMIT_FLAG][ERROR] SDK 初始化失败: {e}", "91;1")
+        res = get_platform().submit(challenge_code, flag)
+    except UnknownChallenge as e:
+        _print_color(f"[SUBMIT_FLAG][ERROR] {e}", "91;1")
+        return FlagSubmitOutcome(ok=False, output=f"[ERROR] 提交 flag 失败: {e}", definitive=True)
+    except (PlatformError, OSError) as e:
+        # 题目定义损坏 / 状态文件不可写等：不记入 verified，留待稍后重试
+        _print_color(f"[SUBMIT_FLAG][ERROR] 平台错误: {e}", "91;1")
         return FlagSubmitOutcome(
             ok=False,
-            output=f"[ERROR] Benchmark SDK 初始化失败: {e}",
+            output=f"chanllege_code:{challenge_code} 提交失败，请稍后再试: {e}",
             definitive=False,
         )
-
-    base_delay = 0.5
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        try:
-            res = client.submit_flag(challenge_code, flag)
-            if not res.correct:
-                _print_color("[SUBMIT_FLAG][INCORRECT] 提交的 flag 错误", "91;1")  # 亮红
-                _flagstore_record_wrong(challenge_code, flag)  # 记入本题错误表
-                return FlagSubmitOutcome(
-                    ok=False,
-                    output=f"chanllege_code:{challenge_code} 提交的 flag 错误",
-                    definitive=True,
-                )
-            _flagstore_record_correct(challenge_code, flag)  # 记入全局正确表（归属本题）
-            try:
-                correct = int(res.correct_flag_count or 0)
-                total = int(res.total_flag_count or 0)
-            except Exception:
-                correct, total = 0, 0
-            if total < 1:
-                qc, qt = query_flag_progress(challenge_code)
-                correct, total = max(correct, qc), max(total, qt)
-            _print_color(
-                f"[SUBMIT_FLAG][OK] 提交正确，本次得分 {res.awarded}，累计 {res.cumulative_score}，"
-                f"flag 进度 {correct}/{total}",
-                "95;1",
-            )
-            base = (
-                f"chanllege_code:{challenge_code} 提交flag正确,成功获取 {res.awarded} 分 "
-                f"(累计 {res.cumulative_score} 分, flag 进度 {correct}/{total})"
-            )
-            remain = (total - correct) if total >= 1 else 0
-            if remain > 0:
-                base += (
-                    f"。本题还有 {remain} 个 flag 未提交，请勿停止，继续挖掘其余 flag"
-                    f"（多 flag 常在同一立足点下的不同位置/权限/接口）；全部 {total} 个 flag 到手后再结束。"
-                )
-            return FlagSubmitOutcome(
-                ok=True, output=base, correct=correct, total=total, definitive=True, fresh=True
-            )
-        except DuplicateSubmit:
-            # 幂等：同一 flag 已正确提交过 —— 记入全局正确表（归属本题）
-            _flagstore_record_correct(challenge_code, flag)
-            c, t = query_flag_progress(challenge_code)
-            base = _with_progress(
-                f"chanllege_code:{challenge_code} 这题目已经提交成功过了", c, t
-            )
-            _print_color(
-                f"[SUBMIT_FLAG][ALREADY SOLVED] 该 flag 已提交成功过"
-                + (f"，进度 {c}/{t}" if t >= 1 else ""),
-                "93;1",
-            )
-            return FlagSubmitOutcome(ok=True, output=base, correct=c, total=t, definitive=True)
-        except (TSecConnectionError, InternalError, ResourceUnavailable) as e:
-            # 瞬时错误：指数退避 + 抖动重试
-            if attempt < max_attempts - 1:
-                sleep_seconds = min(8.0, base_delay * (2 ** attempt)) * (0.5 + random.random())
-                try:
-                    _print_color(f"[SUBMIT_FLAG] 第 {attempt + 1}/{max_attempts} 次提交失败（{e}），退避 {sleep_seconds:.2f}s 后重试…", "93;1")
-                except Exception:
-                    pass
-                time.sleep(sleep_seconds)
-                continue
-            _print_color("[SUBMIT_FLAG][ERROR] 多次重试仍失败，放弃。", "91;1")
-            return FlagSubmitOutcome(
-                ok=False,
-                output=f"chanllege_code:{challenge_code} 提交失败，请稍后再试: {e}",
-                definitive=False,
-            )
-        except TSecError as e:
-            # 平台业务错误（如题目不存在、状态非法）：不重试
-            _print_color(f"[SUBMIT_FLAG][ERROR] 平台错误: {e}", "91;1")
-            return FlagSubmitOutcome(
-                ok=False,
-                output=f"[ERROR] 提交 flag 失败: {e}",
-                definitive=True,
-            )
-        except Exception as e:
-            # 其他异常：记录并进行有限重试
-            try:
-                _print_color(f"[SUBMIT_FLAG][ERROR] 提交异常: {e}", "91;1")
-            except Exception:
-                pass
-            if attempt < max_attempts - 1:
-                sleep_seconds = min(8.0, base_delay * (2 ** attempt)) * (0.5 + random.random())
-                time.sleep(sleep_seconds)
-                continue
-            return FlagSubmitOutcome(ok=False, output="", definitive=False)
-    return FlagSubmitOutcome(ok=False, output="", definitive=False)
+    if not res.correct:
+        _print_color("[SUBMIT_FLAG][INCORRECT] 提交的 flag 错误", "91;1")  # 亮红
+        _flagstore_record_wrong(challenge_code, flag)  # 记入本题错误表
+        return FlagSubmitOutcome(
+            ok=False,
+            output=f"chanllege_code:{challenge_code} 提交的 flag 错误",
+            definitive=True,
+        )
+    # 记入全局正确表（归属本题）；重复提交同样记入（幂等）
+    _flagstore_record_correct(challenge_code, flag)
+    correct, total = res.correct_count, res.total
+    if res.duplicate:
+        base = _with_progress(f"chanllege_code:{challenge_code} 这题目已经提交成功过了", correct, total)
+        _print_color(f"[SUBMIT_FLAG][ALREADY SOLVED] 该 flag 已提交成功过，进度 {correct}/{total}", "93;1")
+        return FlagSubmitOutcome(ok=True, output=base, correct=correct, total=total, definitive=True)
+    _print_color(f"[SUBMIT_FLAG][OK] 提交正确，flag 进度 {correct}/{total}", "95;1")
+    base = f"chanllege_code:{challenge_code} 提交flag正确 (flag 进度 {correct}/{total})"
+    remain = total - correct
+    if remain > 0:
+        base += (
+            f"。本题还有 {remain} 个 flag 未提交，请勿停止，继续挖掘其余 flag"
+            f"（多 flag 常在同一立足点下的不同位置/权限/接口）；全部 {total} 个 flag 到手后再结束。"
+        )
+    return FlagSubmitOutcome(ok=True, output=base, correct=correct, total=total, definitive=True, fresh=True)
 
 
 @tool("submit_flag", args_schema=SubmitFlagInput, return_direct=False)
 def submit_flag(challenge_code: str, flag: str) -> str:
-    """提供 challenge_code 和 flag，通过 tsec-benchmark SDK 提交当前 CTF 题目 Flag。
+    """提供 challenge_code 和 flag，向本地题目平台提交当前 CTF 题目 Flag。
     返回提交结果或错误信息。
     """
     return submit_flag_outcome(challenge_code, flag).output

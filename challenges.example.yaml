@@ -1,0 +1,37 @@
+# Cruiser 本地题目定义示例：复制为 challenges.yaml（已 gitignore）后按需修改，
+# 或用环境变量 CRUISER_CHALLENGES 指向任意路径。
+#
+# 每道题的字段：
+#   code         必填。形如 <字母数字>-<数字>（如 WEB-1），Agent 侧按此形态识别提交命令
+#   difficulty   easy / medium / hard（默认 easy），决定调度顺序
+#   description  题目描述，开局注入 Agent 上下文
+#   hint         可选。三级（200 步）起才下发给 Agent
+#   flags        必填，至少一个。明文，或 sha256:<64 位十六进制>（答案不必明文存放）；
+#                多个 flag 时需全部交齐（进度 X/Y）才算解出
+#   靶场（二选一）：
+#     target     已在运行的服务地址（字符串或列表），启动/关闭均为空操作
+#     compose    docker compose 文件路径（相对本 YAML 所在目录），配合
+#     addresses  交给 Agent 的 host:port 列表（不带协议头时补 http://）
+#                启动 = docker compose -p cruiser_<code> -f <file> up -d
+#                关闭 = docker compose -p cruiser_<code> -f <file> down -v
+
+challenges:
+  # 演示题（docker compose 拉起）：examples/web-demo，flag 以 sha256 形式存放
+  - code: DEMO-1
+    difficulty: easy
+    description: 一个笔记查看器，flag 藏在服务器上。
+    hint: /view 的 name 参数直接拼进了文件路径。
+    flags:
+      - sha256:298286625156a7ce5edaca67dffe582a137b201fe721095e7c70d9441ea96853
+    compose: examples/web-demo/docker-compose.yml
+    addresses: ["127.0.0.1:8081"]
+
+  # 同一道演示题的「已运行服务」写法（无需 Docker）：先在另一个终端执行
+  #   FLAG='flag{cruiser_local_demo_path_traversal}' PORT=5000 uv run python examples/web-demo/app.py
+  # 然后取消下面的注释（并注释掉上面的 DEMO-1）。
+  # - code: DEMO-2
+  #   difficulty: easy
+  #   description: 一个笔记查看器，flag 藏在服务器上。
+  #   flags:
+  #     - flag{cruiser_local_demo_path_traversal}
+  #   target: http://127.0.0.1:5000

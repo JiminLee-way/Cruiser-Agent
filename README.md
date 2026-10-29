@@ -1,12 +1,12 @@
 # Cruiser
 
-Cruiser 是一个面向 CTF 竞赛评测平台（TSec Benchmark）的自动化 Web/逻辑漏洞挖掘与利用 Agent。它对接跑分平台，自动完成「拉取题目 → 启动靶场容器 → 驱动 Agent 解题 → 提交 flag → 关闭容器」的完整闭环，并通过多进程并发、分层调度与跨会话共享黑板机制提升解题吞吐与成功率。
+Cruiser 是一个自动化 CTF Web/逻辑漏洞挖掘与利用 Agent，完全在本机运行：题目由本地 YAML 文件定义（`challenges.yaml`），靶场可以是已在运行的服务或 docker compose 项目。它自动完成「读取题目 → 启动靶场 → 驱动 Agent 解题 → 校验 flag → 关闭靶场」的完整闭环，并通过多进程并发、分层调度与跨会话共享黑板机制提升解题吞吐与成功率。
 
 ## 核心架构
 
 Cruiser 的解题引擎基于 [`claude` CLI](https://docs.anthropic.com/en/docs/claude-code)（`--output-format stream-json` 流式模式）驱动一个自主 Agent，Anthropic 兼容端点默认接入 DeepSeek。系统分为三层进程，边界清晰、崩溃可恢复：
 
-1. **调度层（`main.py` 主进程）** — 唯一与平台交互的进程。轮询未解题目、按难度分层调度、启动 worker、监控 `[COUNT]` 步数、回收容器与孤儿进程，并在本机拉起运行台（默认 `http://127.0.0.1:8765`）。
+1. **调度层（`main.py` 主进程）** — 唯一管理靶场生命周期的进程。轮询未解题目、按难度分层调度、启动 worker、监控 `[COUNT]` 步数、关闭靶场与回收孤儿进程，并在本机拉起运行台（默认 `http://127.0.0.1:8765`）。
 2. **执行层（worker 子进程）** — `main.py --sessions 1 --challenge-code <CODE>` 的副本，带 `CRUISER_WORKER_ID`。调用 `run_auto_scan()`，进而拉起 `claude` CLI 进程。
 3. **Agent 层（`claude` CLI 进程）** — 真正的解题智能体，使用其内置的 Bash/Read/Write 等工具执行侦察与利用。
 
@@ -16,7 +16,8 @@ Cruiser 的解题引擎基于 [`claude` CLI](https://docs.anthropic.com/en/docs/
 
 - **共享黑板** `reports/info_<code>.txt` — 各会话已发现的关键事实（口令、路径、端点、结论等）。
 - **探索方向任务板** `reports/tasks_<code>.txt` — 待认领的探索方向，认领即擦除，先到先得。
-- **共享提示** `reports/hint_<code>.txt` — 从平台拉取的题目提示（各会话共享）。
+- **共享提示** `reports/hint_<code>.txt` — 题目定义中的提示（三级起写入，各会话共享）。
+- **解题进度** `reports/_platform_state.json` — 本地平台记录的每题已交对 flag（跨进程共享，`submit_flag.py` 与调度器共同读写）。
 
 ## 分层调度
 
@@ -29,7 +30,7 @@ Cruiser 的解题引擎基于 [`claude` CLI](https://docs.anthropic.com/en/docs/
 | 二级 | 一级未解出 | 150 | 否 |
 | 三级 | 二级未解出 | 200 | 是（从三级起才拉取提示；解不出则放回队尾按 200 步循环重试） |
 
-每一级对同一道题并发拉起 `--sessions` 个**黑盒** worker 会话（全程黑盒，无源码审计），各会话独立探索、以不同会话编号署名，通过共享黑板交换发现以减少重复探索。可用 `--worker-models` 为每个 worker 指定不同模型（如 2 个 `deepseek-v4-flash` + 1 个 `deepseek-v4-pro`）。平台活跃容器名额（默认 3，`CRUISER_MAX_ACTIVE`）会严格限流。
+每一级对同一道题并发拉起 `--sessions` 个**黑盒** worker 会话（全程黑盒，无源码审计），各会话独立探索、以不同会话编号署名，通过共享黑板交换发现以减少重复探索。可用 `--worker-models` 为每个 worker 指定不同模型（如 2 个 `deepseek-v4-flash` + 1 个 `deepseek-v4-pro`）。同时在跑的题目数上限默认 3（`CRUISER_MAX_ACTIVE`）。
 
 ## 共享黑板机制
 
@@ -40,31 +41,34 @@ Cruiser 的解题引擎基于 [`claude` CLI](https://docs.anthropic.com/en/docs/
 
 ```
 Cruiser/
-├── main.py                  # CLI 入口：平台调度、多会话并发、分层调度、容器/进程治理
+├── main.py                  # CLI 入口：题目调度、多会话并发、分层调度、靶场/进程治理
+├── challenges.example.yaml  # 题目定义示例（复制为 challenges.yaml 使用）
+├── examples/web-demo/       # 演示靶场（Flask + docker compose，含一个路径穿越漏洞）
 ├── blackboard_hook.py       # Claude Code 钩子：描述/提示/黑板硬注入模型上下文
 ├── kill_orphans.py          # 悬空 worker/claude 进程清理兜底
 ├── frontend/                # 运行台静态资源（由 cruiser/dashboard.py 提供）
 ├── tools/                   # Agent 调用的 CLI 封装脚本
-│   ├── submit_flag.py       # 命令行提交 flag（供 Agent 调用，经 SDK 平台确认）
+│   ├── submit_flag.py       # 命令行提交 flag（供 Agent 调用，经本地平台校验）
 │   ├── dirsearch_scan.py    # 跨会话去重的目录扫描 CLI（同一 URL 只实扫一次，其余复用）
 │   ├── task_board.py        # 探索方向任务板命令行（list/claim/report）
 │   └── decompile.py         # PyGhidra 无头反编译 CLI（C 伪码 + 数据引用/switch 分派分析 + 反汇编）
 ├── pyproject.toml           # 项目配置与依赖声明
 ├── cruiser/
 │   ├── __init__.py          # 包初始化：禁用 LangSmith 追踪、加载 .env
+│   ├── challenges.py        # 本地题目平台：YAML 题目定义、靶场启停、flag 校验与进度
 │   ├── claude_agent.py      # 当前解题引擎：claude CLI 驱动 + 黑板 watcher
 │   ├── taskboard.py         # 任务板读写（文件锁 + 原子重写）
 │   ├── llm.py               # LLM 提供者：解题(DeepSeek) / watcher(deepseek-v4-pro)
 │   ├── dashboard.py         # 运行台 HTTP：快照 / 黑板 / 任务板 / 日志
 │   ├── runtime.py           # 调度器运行态快照（供运行台读取）
 │   ├── prompt.py            # 系统提示词与任务模板
-│   ├── tools.py             # SDK 客户端、submit_flag、dirsearch/xss 等工具
+│   ├── tools.py             # submit_flag、dirsearch/xss 等工具
 │   └── agent.py             # 旧版手写 ReAct 引擎（已弃用，保留供参考）
 ├── resource/                # 用户名/密码/XSS payload 字典
 ├── kb/                      # 离线漏洞知识库（git submodule：vulhub / nuclei-templates / PayloadsAllTheThings；nuclei 二进制需自行下载）
-├── vpn/                     # 靶场 VPN 配置（空目录入库；*.ovpn 由平台下发，不入库）
-├── doc/                     # SDK_API.md（平台 SDK 文档）+ TECHNICAL_DESIGN.md（技术方案）
-└── reports/                 # 运行时共享黑板 / 任务板 / 提示文件（空目录入库；内容自动生成，不入库）
+├── tests/                   # pytest 测试（本地平台、flag 提交、调度器冒烟）
+├── doc/                     # TECHNICAL_DESIGN.md（技术方案）
+└── reports/                 # 运行时共享黑板 / 任务板 / 提示 / 解题进度（空目录入库；内容自动生成，不入库）
 ```
 
 > **离线知识库说明**：`kb/` 下三个目录是 git submodule，分别链接
@@ -82,7 +86,7 @@ Cruiser/
 - Python >= 3.11
 - [uv](https://docs.astral.sh/uv/) 包管理器
 - **[claude CLI](https://docs.anthropic.com/en/docs/claude-code)**（必须安装且在 PATH 中，否则引擎无法启动）
-- 已连接靶场 VPN（`main.py` 主进程会用 `vpn/*.ovpn` 自动连接；`vpn/` 为空时跳过 VPN、直接答题）
+- 可选：Docker（含 compose 插件）——仅 `compose:` 类型的题目需要；`target:` 类型的题目无需 Docker
 - 可选：Ghidra + JDK（供 `tools/decompile.py` PyGhidra 逆向使用）
 
 ## 安装
@@ -110,11 +114,9 @@ uv sync
 
 ## 配置
 
-平台凭证与 API 密钥**一律通过环境变量提供**（可写入项目根目录 `.env`，不覆盖已存在的环境变量）；源码中不含任何硬编码密钥。仓库提供 `.env.example` 模板，复制为 `.env` 后填入真实值即可：
+API 密钥**一律通过环境变量提供**（可写入项目根目录 `.env`，不覆盖已存在的环境变量）；源码中不含任何硬编码密钥。仓库提供 `.env.example` 模板，复制为 `.env` 后填入真实值即可：
 
 ```bash
-BENCHMARK_BASE_URL=https://<跑分平台地址>   # 平台 API 地址
-BENCHMARK_TOKEN=<跑分任务凭证>              # 由平台创建跑分任务后下发
 DEEPSEEK_API_KEY=<DeepSeek 密钥>           # 必填：解题引擎(claude CLI) 与 watcher 默认用
 KIMI_API_KEY=<Kimi/Moonshot 密钥>          # 选填：当 worker/watcher 指定 kimi 模型时使用
 GLM_API_KEY=<腾讯 TokenHub 密钥>           # 选填：当 worker/watcher 指定 glm 模型时使用
@@ -131,24 +133,73 @@ GLM_API_KEY=<腾讯 TokenHub 密钥>           # 选填：当 worker/watcher 指
 > 开启 thinking（`MAX_THINKING_TOKENS=32000`，可调）。glm-5.3/5.2 上下文窗口为 1M
 > （框架默认按此管理压缩）；glm-5.1/5/5-turbo 等老模型为 200K，使用时请显式设置
 > `CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000`。
-> TokenHub 默认走比赛内网 `http://tokenhub.tencentmaas.com.tsecbench.gw`；`--local` 切回
-> 公网 `https://tokenhub.tencentmaas.com`。亦可用 `GLM_ANTHROPIC_BASE_URL` / `GLM_BASE_URL` 覆盖。
+> TokenHub 默认端点为 `https://tokenhub.tencentmaas.com`，可用 `GLM_ANTHROPIC_BASE_URL` / `GLM_BASE_URL` 覆盖。
 
-> **端点默认值**:各提供方端点默认使用比赛内网形式(http + `.tsecbench.gw` 后缀,如
-> `http://api.deepseek.com.tsecbench.gw/v1`)。本地联网调试时加 `--local` 参数即切回原始官方
-> https 域名(如 `https://api.deepseek.com/v1`);两者均可再用 `*_BASE_URL` 环境变量显式覆盖。
+> **端点默认值**：各提供方端点默认使用官方 https 地址（如 `https://api.deepseek.com/anthropic`、
+> `https://api.deepseek.com/v1`），均可用对应 `*_BASE_URL` 环境变量显式覆盖（如接入自建网关/代理）。
 
 > 提示：请勿将含真实密钥的 `.env` 提交到版本库，建议加入 `.gitignore` 并妥善轮换。
 
+## 题目定义（本地平台）
+
+Cruiser 不依赖任何外部比赛平台：题目、靶场与 flag 答案都写在一个 YAML 文件里，由 `cruiser/challenges.py` 管理。
+文件路径取 `CRUISER_CHALLENGES`（相对路径按当前目录解析），默认项目根目录的 `challenges.yaml`（已 gitignore，模板见 `challenges.example.yaml`）。
+
+```yaml
+challenges:
+  - code: WEB-1                  # 必填，形如 <字母数字>-<数字>（Agent 侧按此形态识别提交命令）
+    difficulty: easy             # easy / medium / hard（默认 easy），决定调度顺序
+    description: 登录页面，管理员口令很弱
+    hint: 试试常见弱口令          # 可选；三级（200 步）起才下发给 Agent
+    flags:                       # 必填，至少一个；多个 flag 需全部交齐（进度 X/Y）才算解出
+      - flag{plain_text_flag}    # 明文
+      - sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08   # 或 sha256 摘要，答案不必明文存放
+    target: http://127.0.0.1:8080   # 靶场二选一 ①：已在运行的服务（字符串或列表），启动/关闭均为空操作
+
+  - code: WEB-2
+    difficulty: medium
+    flags: ["flag{another_one}"]  # 行内列表 [...] 里的 flag 含花括号，必须加引号
+    compose: challenges/web2/docker-compose.yml   # 靶场二选一 ②：docker compose 文件（相对本 YAML 所在目录）
+    addresses: ["127.0.0.1:8082"]                 # compose 必填：交给 Agent 的地址（不带协议头时补 http://）
+```
+
+- **compose 靶场**：启动执行 `docker compose -p cruiser_<code> -f <file> up -d`，随后做端口就绪探测（`CRUISER_CONTAINER_WARMUP`）；每轮结束执行 `docker compose -p cruiser_<code> -f <file> down -v`。调度器启动与退出时会 `down` 掉所有残留的 `cruiser_*` 项目。
+- **解题进度**落盘在 `reports/_platform_state.json`（`fcntl` 文件锁 + 原子重写，worker、solver 与 Agent 调用的 `submit_flag.py` 跨进程共享）。重复提交已交对的 flag 视为幂等成功；全部 flag 交齐后该题从未解列表中移除，所有题解出后调度器自动退出。
+- 题目定义文件改动后会自动重新加载（按 mtime）；YAML 校验失败时启动即报错并指出出错的题目与字段。
+
+平台命令行：
+
+```bash
+uv run python -m cruiser.challenges list            # 查看题目与 flag 进度
+uv run python -m cruiser.challenges reset [CODE…]   # 清空进度（不带参数清空全部），用于重跑
+uv run python -m cruiser.challenges down            # 手动 down 掉所有 cruiser_* compose 项目
+```
+
+### 端到端演示
+
+`examples/web-demo/` 是一个约 30 行的 Flask 靶场（笔记查看器，`/view?name=` 存在路径穿越，flag 来自环境变量 `FLAG`）：
+
+```bash
+cp challenges.example.yaml challenges.yaml   # 内含 DEMO-1（compose 方式，flag 以 sha256 存放）
+cp .env.example .env                          # 填入 DEEPSEEK_API_KEY
+uv run python main.py --sessions 2
+```
+
+没有 Docker 时，可先手动启动服务，再按 `challenges.example.yaml` 中注释的 `DEMO-2`（`target:` 方式）配置：
+
+```bash
+FLAG='flag{cruiser_local_demo_path_traversal}' PORT=5000 uv run python examples/web-demo/app.py
+```
+
 ## 使用方法
 
-### 自动模式（从平台拉取未解题目，推荐）
+### 自动模式（按题目定义逐题调度，推荐）
 
 ```bash
 uv run python main.py --sessions 5
 ```
 
-主进程自动连接 VPN、清理遗留容器，然后持续拉取未解题目并按分层调度并发解题。浏览器打开 `http://127.0.0.1:8765` 可看运行台。
+主进程校验题目定义、清理遗留的 `cruiser_*` compose 项目，然后按分层调度并发解题，全部题目解出后退出。浏览器打开 `http://127.0.0.1:8765` 可看运行台。
 
 ### 指定单目标扫描
 
@@ -156,18 +207,19 @@ uv run python main.py --sessions 5
 uv run python main.py --target http://<IP:端口> --challenge-code <CODE>
 ```
 
+`<CODE>` 必须是题目定义中的题目（flag 校验依赖其答案）；不给 `--target` 时由本地平台启动该题靶场。
+
 ### 命令行参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--target` | 无 | 扫描目标地址（未提供时由 SDK 启动容器获取直连地址） |
+| `--target` | 无 | 扫描目标地址（未提供时由本地平台启动该题靶场获取地址） |
 | `--challenge-code` | 无 | 题目代码 |
 | `--sessions` | 1 | 并发工作会话数量（>=2 时进入分层调度） |
 | `--worker-models` | 无 | 逗号分隔的各 worker 模型清单（如 `deepseek-v4-flash,deepseek-v4-flash,kimi-k3`）；提供时 worker 数量=清单长度，覆盖 `--sessions`；`kimi-*` 模型自动路由到 Kimi 端点 |
 | `--max-steps` | 0 | AI 扫描最大步数（0 = 不在引擎内强制终止，由调度器按阈值监控） |
 | `--hint` | 无 | 题目提示（辅助 Agent 推理） |
 | `--quiet` | False | 静默中间输出，仅保留最终 JSON |
-| `--local` | False | 本地测试模式：大模型端点切回原始官方 https 域名（默认走比赛内网 `.tsecbench.gw` 域名） |
 | `--default-timeout` | 0 | `run_command` 默认超时秒数（0 = 内置默认） |
 | `--max-timeout` | 0 | `run_command` 超时上限秒数（0 = 内置上限） |
 
@@ -175,16 +227,16 @@ uv run python main.py --target http://<IP:端口> --challenge-code <CODE>
 
 | 变量 | 说明 |
 |------|------|
-| `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | 平台 API 地址与跑分凭证（必填） |
+| `CRUISER_CHALLENGES` | 题目定义 YAML 路径（默认项目根目录 `challenges.yaml`） |
 | `DEEPSEEK_API_KEY` | DeepSeek 密钥（解题引擎与 watcher 默认使用） |
 | `KIMI_API_KEY` | Kimi/Moonshot 密钥（当模型为 `kimi-*` 时自动使用） |
 | `GLM_API_KEY` | 腾讯 TokenHub 密钥（当模型为 `glm-*` 时自动使用） |
-| `GLM_ANTHROPIC_BASE_URL` / `GLM_BASE_URL` | GLM 的 Anthropic / OpenAI 兼容端点（默认比赛内网 `http://tokenhub.tencentmaas.com.tsecbench.gw`、`.../v1`；`--local` 切回 `https://tokenhub.tencentmaas.com/...`） |
+| `GLM_ANTHROPIC_BASE_URL` / `GLM_BASE_URL` | GLM 的 Anthropic / OpenAI 兼容端点（默认 `https://tokenhub.tencentmaas.com`、`.../v1`） |
 | `CRUISER_MODEL` | 解题引擎模型（最高优先级，覆盖 `ANTHROPIC_MODEL`/`DEEPSEEK_MODEL`；推荐跨厂商指定方式，如 `glm-5.3`） |
-| `KIMI_ANTHROPIC_BASE_URL` / `KIMI_BASE_URL` | Kimi 的 Anthropic / OpenAI 兼容端点（默认比赛内网 `http://api.moonshot.cn.tsecbench.gw/anthropic`、`.../v1`；`--local` 切回 `https://api.moonshot.cn/...`） |
+| `KIMI_ANTHROPIC_BASE_URL` / `KIMI_BASE_URL` | Kimi 的 Anthropic / OpenAI 兼容端点（默认 `https://api.moonshot.cn/anthropic`、`.../v1`） |
 | `DEEPSEEK_MODEL` / `ANTHROPIC_MODEL` | 解题引擎模型（默认 `deepseek-v4-flash`） |
-| `DEEPSEEK_BASE_URL` | DeepSeek OpenAI 兼容端点（默认比赛内网 `http://api.deepseek.com.tsecbench.gw/v1`；`--local` 切回 `https://api.deepseek.com/v1`） |
-| `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` | claude CLI 接入的 Anthropic 兼容端点与令牌 |
+| `DEEPSEEK_BASE_URL` | DeepSeek OpenAI 兼容端点（默认 `https://api.deepseek.com/v1`） |
+| `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` | claude CLI 接入的 Anthropic 兼容端点（DeepSeek 默认 `https://api.deepseek.com/anthropic`）与令牌 |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | 声明模型真实上下文窗口（默认 `1000000`，即 DeepSeek 1M，用于校正 auto-compact 触发时机） |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 提前触发上下文压缩的阈值 token 数（默认 `800000`，留出余量避免逼近硬上限） |
 | `WATCHER_MODEL` | 黑板 watcher 模型（默认 `deepseek-v4-pro`） |
@@ -195,9 +247,8 @@ uv run python main.py --target http://<IP:端口> --challenge-code <CODE>
 | `CRUISER_DASHBOARD` | 设为 `0` 关闭运行台（默认开启） |
 | `CRUISER_DASHBOARD_HOST` / `CRUISER_DASHBOARD_PORT` | 运行台监听地址与端口（默认 `127.0.0.1:8765`） |
 | `CRUISER_LOG_FILE` | 运行台读取的调度日志路径（默认 `/tmp/cruiser.log`） |
-| `CRUISER_MAX_ACTIVE` | 平台活跃容器名额上限（默认 3） |
-| `CRUISER_LOCAL` | 设为 `1` 启用本地测试模式（大模型端点切回原始官方 https 域名）；等价于 `--local` |
-| `CRUISER_CONTAINER_WARMUP` | 容器就绪探测上限秒数（默认 60）：拿到地址后主动探测目标端口，可连即拉起会话，超时也放行交由 LLM 解题以防卡死 |
+| `CRUISER_MAX_ACTIVE` | 同时在跑的题目数上限（默认 3） |
+| `CRUISER_CONTAINER_WARMUP` | 靶场就绪探测上限秒数（默认 60）：拿到地址后主动探测目标端口，可连即拉起会话，超时也放行交由 LLM 解题以防卡死 |
 | `CRUISER_KB_DIR` | 离线漏洞知识库目录（默认 `kb/`；供 nuclei/PoC 检索使用） |
 | `CRUISER_MAX_TURNS` | 单个 claude 会话最大**回合(turn)**数（默认 0 = 不限制；注意 turn ≠ 日志 `[COUNT]`，`[COUNT]` 约为其数倍） |
 | `CRUISER_SOLVER_MAX_TURNS` / `CRUISER_MAX_SOLVERS` / `CRUISER_SOLVER_MODEL` | solver 单会话回合上限（默认 40）/ 每题并发 solver 上限（默认 3）/ solver 模型（默认 `deepseek-v4-flash`） |
@@ -214,7 +265,8 @@ uv run python main.py --target http://<IP:端口> --challenge-code <CODE>
 
 | 工具/脚本 | 功能 |
 |-----------|------|
-| `tools/submit_flag.py` | 经 tsec-benchmark SDK 提交并确认 flag |
+| `tools/submit_flag.py` | 向本地平台提交并校验 flag（回执含进度 X/Y） |
+| `python -m cruiser.challenges` | 本地平台命令行：`list` / `reset` / `down` |
 | `tools/dirsearch_scan.py` | 跨会话去重的目录扫描（多会话对同一 URL 仅实扫一次，其余阻塞复用报告） |
 | `tools/task_board.py` | 任务板 `list` / `claim` / `report` |
 | `tools/decompile.py` | PyGhidra 无头反编译：输出 C 伪码，并标注被编译器消除的取数、switch 各 case 语义与未确认的 opcode |
@@ -226,6 +278,14 @@ uv run python main.py --target http://<IP:端口> --challenge-code <CODE>
 | 智能合约 | Foundry（`forge`/`cast`/`anvil`）/ 多版本 `solc` / `slither` / `web3.py` |
 | 离线知识库 | `kb/`：vulhub / nuclei-templates / PayloadsAllTheThings（支持按 CVE/组件本地检索 PoC） |
 | `resource/*.txt` | 用户名 / 密码 / XSS payload 字典 |
+
+## 测试
+
+```bash
+uv run pytest
+```
+
+覆盖 YAML 解析与校验、明文/sha256 flag 校验、多 flag X/Y 进度、重复提交、多进程并发提交、compose 启停（mock `subprocess`）、`tools/submit_flag.py` 端到端，以及用 stub `claude` CLI 跑通 `main.py --sessions 2` 的调度器冒烟测试（无需 LLM 密钥、Docker 或网络）。
 
 ## 许可证
 

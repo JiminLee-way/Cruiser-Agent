@@ -4,7 +4,7 @@
 - 每个 assistant 事件计为一步并打印 [COUNT] n（供 main.py 调度器做步数阈值监控，语义不变）
 - 共享关键信息黑板机制不变：reports/info_<code>.txt 与 hint_<code>.txt 的
   文件、格式、读写时机均由提示词约定，Claude Code 用自身文件工具直接读写
-- flag 必须经 tools/submit_flag.py（tsec-benchmark SDK）确认后，才输出最终 JSON
+- flag 必须经 tools/submit_flag.py（本地题目平台 cruiser/challenges.py）确认后，才输出最终 JSON
 """
 from __future__ import annotations
 
