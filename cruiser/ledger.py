@@ -217,6 +217,15 @@ def _load(code: str) -> _Ledger:
     return _Ledger(doc["entries"], doc.get("digest"))
 
 
+def _view(code: str) -> _Ledger:
+    """The ledger as readers see it: an unparsable file reads as empty, with a warning, so it cannot stop sessions."""
+    try:
+        return _load(code)
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"[Ledger] cannot read {_ledger_path(code)} ({e}); continuing without shared state", flush=True)
+        return _Ledger([], None)
+
+
 def _write_atomic(path: str, text: str) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -258,7 +267,7 @@ def _public(e: Entry) -> dict:
 
 
 def _entries(code: str, kinds: tuple[str, ...], include_superseded: bool) -> list[dict]:
-    led = _load(code)
+    led = _view(code)
     rows = [e for e in led.entries if e["kind"] in kinds] if include_superseded else led.live(kinds)
     return [_public(e) for e in rows]
 
@@ -289,7 +298,7 @@ def add_result(code: str, author: str, task: str, text: str) -> Optional[str]:
 def has_result(code: str, author: str, task: str) -> bool:
     """Whether author ever reported a result for task (superseded results count)."""
     task = _clean(task, _TASK_CAP)
-    return any(e["kind"] == "result" and e["author"] == author and e.get("task") == task for e in _load(code).entries)
+    return any(e["kind"] == "result" and e["author"] == author and e.get("task") == task for e in _view(code).entries)
 
 
 def set_status(code: str, entry_id: str, status: str, note: str = "", by: str = "") -> bool:
@@ -312,7 +321,7 @@ def set_digest(code: str, author: str, text: str) -> bool:
 
 
 def digest(code: str) -> str:
-    return (_load(code).digest or {}).get("text", "")
+    return (_view(code).digest or {}).get("text", "")
 
 
 def _fit_context(digest_text: str, lines: list[str], budget: int) -> str:
@@ -343,7 +352,7 @@ def _fit_context(digest_text: str, lines: list[str], budget: int) -> str:
 
 def context_text(code: str, budget: int = 3000) -> str:
     """Text injected at session start: the solve-state digest, then the newest live facts and task results."""
-    led = _load(code)
+    led = _view(code)
     lines = ["- " + _view_line(e) for e in led.live()]
     return _fit_context((led.digest or {}).get("text", ""), lines, budget)
 

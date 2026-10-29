@@ -129,11 +129,17 @@ def _project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def run_id() -> str:
+    """This run's id, set once in the process environment so every worker and solver it spawns inherits it."""
+    return os.environ.setdefault("CRUISER_RUN_ID", uuid.uuid4().hex[:8])
+
+
 def workspace_dir(code: str, worker_id: str, *, resumable: bool) -> str:
     """Create and return a worker's working directory. A resumable explorer slot keeps one per challenge
-    across rounds, so its resumed conversation finds the files it wrote; a one-shot solver gets a fresh one."""
+    across the rounds of one run, so its resumed conversation finds the files it wrote; a later run starts
+    in a new one. A one-shot solver gets a fresh one."""
     base = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-    name = f"ws_{code or 'nocode'}_{worker_id}" + ("" if resumable else f"_{uuid.uuid4().hex[:8]}")
+    name = f"ws_{code or 'nocode'}_{worker_id}_" + (run_id() if resumable else uuid.uuid4().hex[:8])
     path = os.path.join(base, name)
     os.makedirs(path, exist_ok=True)
     return path

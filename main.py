@@ -1,4 +1,4 @@
-from cruiser.claude_agent import SINGLE_WORKER_ID, run_auto_scan, workspace_dir
+from cruiser.claude_agent import SINGLE_WORKER_ID, run_auto_scan, run_id, workspace_dir
 import argparse
 import atexit
 import json
@@ -40,6 +40,7 @@ def main():
         help="(internal) solver only: focus this run on this single exploration direction, without exploring the whole challenge",
     )
     args = parser.parse_args()
+    run_id()  # before any child env is copied, so the whole run shares one id
     # inject the timeout policy into the environment for the current/child sessions
     if args.default_timeout and args.default_timeout > 0:
         os.environ["CRUISER_DEFAULT_TIMEOUT"] = str(args.default_timeout)
