@@ -1,4 +1,4 @@
-from cruiser.claude_agent import SINGLE_WORKER_ID, run_auto_scan, run_id, workspace_dir
+from cruiser.claude_agent import SINGLE_WORKER_ID, ensure_run_id, run_auto_scan, solver_worker_id, workspace_dir
 import argparse
 import atexit
 import json
@@ -40,7 +40,7 @@ def main():
         help="(internal) solver only: focus this run on this single exploration direction, without exploring the whole challenge",
     )
     args = parser.parse_args()
-    run_id()  # before any child env is copied, so the whole run shares one id
+    ensure_run_id()
     # inject the timeout policy into the environment for the current/child sessions
     if args.default_timeout and args.default_timeout > 0:
         os.environ["CRUISER_DEFAULT_TIMEOUT"] = str(args.default_timeout)
@@ -373,7 +373,7 @@ def main():
         if args.quiet:
             cmd.append("--quiet")
         env = os.environ.copy()
-        env["CRUISER_WORKER_ID"] = f"solver{sid}"   # treated as a worker subprocess: skips the startup self-check and does not parse worker_models
+        env["CRUISER_WORKER_ID"] = solver_worker_id(sid)   # treated as a worker subprocess: skips the startup self-check and does not parse worker_models
         env["CRUISER_SESSIONS"] = str(num)
         env["CRUISER_CHALLENGE_CODE"] = code
         env.pop("CRUISER_WORKER_MODELS", None)
@@ -385,7 +385,7 @@ def main():
             env.pop("CRUISER_DEBUG_STDERR", None)
             env["CRUISER_QUIET"] = "0"
         try:
-            env["CRUISER_WORKSPACE_DIR"] = workspace_dir(code, f"solver{sid}", resumable=False)
+            env["CRUISER_WORKSPACE_DIR"] = workspace_dir(code, solver_worker_id(sid), resumable=False)
         except OSError:
             pass
         p = subprocess.Popen(
@@ -584,7 +584,7 @@ def main():
                         runtime.push_log(code, f"SOLVER{sid}", line)
                         m = count_re.search(line)
                         if m:
-                            runtime.stage_count(code, f"solver{sid}", int(m.group(1)))
+                            runtime.stage_count(code, solver_worker_id(sid), int(m.group(1)))
                     except Exception:
                         pass
 
@@ -603,8 +603,7 @@ def main():
                 while len(active) < MAX_SOLVERS_PER_CHALLENGE and not _solver_stage_over(grp):
                     sid = sid_seq + 1
                     try:
-                        # claim under the worker id the solver will run as, so its report finds the claim
-                        claimed = claim_task(code, f"solver{sid}")
+                        claimed = claim_task(code, solver_worker_id(sid))
                     except Exception:
                         claimed = None
                     if not claimed:

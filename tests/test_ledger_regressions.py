@@ -1,4 +1,3 @@
-"""Regressions in the shared ledger, task results and watcher curation."""
 from __future__ import annotations
 
 import json
@@ -108,7 +107,6 @@ def test_watcher_does_not_store_a_dict_add_item(reports, run_watcher):
 
 
 def test_watcher_does_not_publish_a_task_without_text(reports, run_watcher):
-    # distinct bases keep the board's similarity dedup from hiding either item
     run_watcher("2", {"suggest_tasks": [
         {"basis": "f-aaaaaa"},
         {"text": "derive the output from the seed", "basis": "f-bbbbbb"},

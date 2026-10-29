@@ -1,4 +1,3 @@
-"""Engine sessions: workspaces, the child environment, and how a solver's conclusion reaches the ledger."""
 from __future__ import annotations
 
 import os

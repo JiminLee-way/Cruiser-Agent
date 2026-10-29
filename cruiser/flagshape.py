@@ -1,8 +1,3 @@
-"""The one definition of an answer-token-shaped string (PREFIX{body}).
-
-The scheduler auto-submits every such string it sees in session output and in the rendered board, so shared
-state (ledger, task board) stores them only redacted.
-"""
 from __future__ import annotations
 
 import re

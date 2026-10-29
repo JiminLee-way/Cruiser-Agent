@@ -210,8 +210,6 @@ def retire_task(code: str, ref: str) -> bool:
 
 
 def report_task(code: str, worker_id: str, text: str, task: str = "") -> bool:
-    """Report completion as a task result in the shared ledger (cruiser.ledger). Without a task, the result
-    belongs to the reporter's newest claim."""
     from . import ledger
     if not task:
         mine = [c["text"] for c in list_claimed(code) if c["worker"] == worker_id]

@@ -1,17 +1,4 @@
-"""Shared ledger: entries are never deleted; the blackboard text is rendered from it.
-
-One document per challenge, reports/ledger_<code>.json:
-    {"entries": [Entry], "digest": {"ts", "author", "text"} | null}
-An Entry is a fact, a [flag-method] (how a flag was obtained) or a task result. Its status history only grows;
-the current status is the last one ("open" when empty) and moves only along _NEXT. A superseded entry is hidden
-from every view but stays in the document. The digest is the watcher's "solve state" summary (latest wins).
-
-Every write goes through _commit: one load, one change and one save under an exclusive lock, so dedup and
-status moves see the state they change. The save replaces the file atomically, so readers load without a lock.
-Every stored string is redacted (cruiser.flagshape) and capped. reports/info_<code>.txt is the rendered view
-read by cruiser.runtime.parse_blackboard and by the sessions.
-
-Each session slot's engine session id is kept in reports/sessions_<code>.json, so after a stage switch the
+"""Each session slot's engine session id is kept in reports/sessions_<code>.json, so after a stage switch the
 same slot continues its conversation instead of starting over.
 """
 from __future__ import annotations
@@ -42,7 +29,7 @@ class Entry(TypedDict):
     author: str
     kind: Kind
     text: str
-    task: NotRequired[str]  # results only
+    task: NotRequired[str]
     history: list[StatusChange]
 
 
@@ -99,13 +86,11 @@ def _flatten(text: str) -> str:
 
 
 def _clean(text: str, cap: int) -> str:
-    """Redact, strip and cap; "" when only placeholders and punctuation are left."""
     s = redact(text).strip()[:cap].strip()
     return s if re.sub(r"[\W_]+", "", s.replace(PLACEHOLDER, "")) else ""
 
 
-def _flag_key(text: str) -> str:
-    """Which flag ('1', '2', ...) a [flag-method] text describes; "" when it cannot be told."""
+def _flag_index(text: str) -> str:
     for pattern in (r"progress\s*(\d+)\s*/\s*\d+", r"(?:flag|FLAG)\s*(\d+)", r"第\s*(\d+)\s*[枚个份]"):
         m = re.search(pattern, text or "")
         if m:
@@ -123,8 +108,6 @@ def _notes(e: Entry) -> list[str]:
 
 
 class _Ledger:
-    """The loaded document; mutated only inside _commit."""
-
     def __init__(self, entries: list[Entry], digest: Optional[dict]):
         self.entries = entries
         self.digest = digest
@@ -140,14 +123,12 @@ class _Ledger:
         return [e for e in self.entries if e["kind"] in kinds and _status(e) != "superseded"]
 
     def duplicate(self, kind: Kind, text: str, task: str) -> Optional[Entry]:
-        """The live entry that already says this: same normalized text (and task, for results); for a
-        [flag-method], also any live [flag-method] about the same flag."""
         group = ("result",) if kind == "result" else _FACT_KINDS
-        key = _flag_key(text) if kind == "flag_method" else ""
+        key = _flag_index(text) if kind == "flag_method" else ""
         for e in self.live(group):
             if _norm(e["text"]) == _norm(text) and e.get("task", "") == task:
                 return e
-            if key and e["kind"] == "flag_method" and _flag_key(e["text"]) == key:
+            if key and e["kind"] == "flag_method" and _flag_index(e["text"]) == key:
                 return e
         return None
 
@@ -207,8 +188,7 @@ class _Ledger:
         return True
 
 
-def _load(code: str) -> _Ledger:
-    """Missing file = empty ledger. An unparsable file raises, so no writer replaces a ledger it could not read."""
+def _load_strict(code: str) -> _Ledger:
     try:
         with open(_ledger_path(code), "r", encoding="utf-8") as f:
             doc = json.load(f)
@@ -217,10 +197,9 @@ def _load(code: str) -> _Ledger:
     return _Ledger(doc["entries"], doc.get("digest"))
 
 
-def _view(code: str) -> _Ledger:
-    """The ledger as readers see it: an unparsable file reads as empty, with a warning, so it cannot stop sessions."""
+def _load_or_empty(code: str) -> _Ledger:
     try:
-        return _load(code)
+        return _load_strict(code)
     except (ValueError, KeyError, TypeError) as e:
         print(f"[Ledger] cannot read {_ledger_path(code)} ({e}); continuing without shared state", flush=True)
         return _Ledger([], None)
@@ -246,11 +225,10 @@ def _render(led: _Ledger) -> str:
 
 
 def _commit(code: str, change: Callable[[_Ledger], T]) -> T:
-    """The only write path: lock, load once, change, then save and render once if anything changed."""
     os.makedirs(_reports_dir(), exist_ok=True)
     with open(_ledger_path(code) + ".lock", "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        led = _load(code)
+        led = _load_strict(code)
         result = change(led)
         if led.changed:
             _write_atomic(_ledger_path(code), json.dumps(led.document(), ensure_ascii=False))
@@ -267,23 +245,20 @@ def _public(e: Entry) -> dict:
 
 
 def _entries(code: str, kinds: tuple[str, ...], include_superseded: bool) -> list[dict]:
-    led = _view(code)
+    led = _load_or_empty(code)
     rows = [e for e in led.entries if e["kind"] in kinds] if include_superseded else led.live(kinds)
     return [_public(e) for e in rows]
 
 
 def facts(code: str, include_superseded: bool = False) -> list[dict]:
-    """Facts and [flag-method] entries: [{id, ts, author, kind, text, status, notes}], in write order."""
     return _entries(code, _FACT_KINDS, include_superseded)
 
 
 def results(code: str, include_superseded: bool = False) -> list[dict]:
-    """Task results: [{id, ts, author, kind, text, task, status, notes}], in write order."""
     return _entries(code, ("result",), include_superseded)
 
 
 def add_fact(code: str, author: str, text: str, kind: Kind = "fact") -> Optional[str]:
-    """New entry id; None when the text is empty after redaction or a live entry already says it."""
     if not code:
         return None
     return _commit(code, lambda led: led.add(author, kind, text))
@@ -296,21 +271,15 @@ def add_result(code: str, author: str, task: str, text: str) -> Optional[str]:
 
 
 def has_result(code: str, author: str, task: str) -> bool:
-    """Whether author ever reported a result for task (superseded results count)."""
     task = _clean(task, _TASK_CAP)
-    return any(e["kind"] == "result" and e["author"] == author and e.get("task") == task for e in _view(code).entries)
+    return any(e["kind"] == "result" and e["author"] == author and e.get("task") == task for e in _load_or_empty(code).entries)
 
 
 def set_status(code: str, entry_id: str, status: str, note: str = "", by: str = "") -> bool:
-    """Move a fact or result along _NEXT. False (and nothing written) for an unknown id or status, a
-    [flag-method], a forbidden move, or a repeat of the current status without a new note."""
     return _commit(code, lambda led: led.move(entry_id, status, note, by))
 
 
 def supersede(code: str, entry_id: str, new_text: str, by: str = "") -> Optional[str]:
-    """Replace an entry: the old one is hidden and points at the replacement. The replacement is the live
-    entry that already says new_text, else a new entry of the old one's kind. Returns its id, or None when
-    the old entry is unknown or cannot be superseded."""
     return _commit(code, lambda led: led.supersede(entry_id, new_text, by))
 
 
@@ -321,12 +290,10 @@ def set_digest(code: str, author: str, text: str) -> bool:
 
 
 def digest(code: str) -> str:
-    return (_view(code).digest or {}).get("text", "")
+    return (_load_or_empty(code).digest or {}).get("text", "")
 
 
 def _fit_context(digest_text: str, lines: list[str], budget: int) -> str:
-    """Digest first, then the newest lines. The lines get at least budget//3, the digest at most the rest,
-    and the result is never longer than budget."""
     lines = [ln[:_LINE_CAP] for ln in lines]
     gap = "\n\n"
     want = len(_ENTRIES_HEAD) + sum(len(ln) + 1 for ln in lines) - 1 if lines else 0
@@ -351,8 +318,7 @@ def _fit_context(digest_text: str, lines: list[str], budget: int) -> str:
 
 
 def context_text(code: str, budget: int = 3000) -> str:
-    """Text injected at session start: the solve-state digest, then the newest live facts and task results."""
-    led = _view(code)
+    led = _load_or_empty(code)
     lines = ["- " + _view_line(e) for e in led.live()]
     return _fit_context((led.digest or {}).get("text", ""), lines, budget)
 
@@ -386,7 +352,6 @@ def _update_sessions(code: str, mutate) -> None:
 
 
 def session_set(code: str, slot: str, engine: str, session_id: str, ws: str = "") -> None:
-    """Remember a slot's engine session and the workspace it ran in (a resume is only valid in the same one)."""
     if code and slot and session_id:
         _update_sessions(code, lambda d: d.__setitem__(
             slot, {"engine": engine, "id": session_id, "ws": ws, "ts": int(time.time())}))

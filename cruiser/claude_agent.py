@@ -19,7 +19,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -129,17 +129,13 @@ def _project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def run_id() -> str:
-    """This run's id, set once in the process environment so every worker and solver it spawns inherits it."""
+def ensure_run_id() -> str:
     return os.environ.setdefault("CRUISER_RUN_ID", uuid.uuid4().hex[:8])
 
 
 def workspace_dir(code: str, worker_id: str, *, resumable: bool) -> str:
-    """Create and return a worker's working directory. A resumable explorer slot keeps one per challenge
-    across the rounds of one run, so its resumed conversation finds the files it wrote; a later run starts
-    in a new one. A one-shot solver gets a fresh one."""
     base = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
-    name = f"ws_{code or 'nocode'}_{worker_id}_" + (run_id() if resumable else uuid.uuid4().hex[:8])
+    name = f"ws_{code or 'nocode'}_{worker_id}_" + (ensure_run_id() if resumable else uuid.uuid4().hex[:8])
     path = os.path.join(base, name)
     os.makedirs(path, exist_ok=True)
     return path
@@ -192,9 +188,12 @@ _WATCHER_PROMPT_TEMPLATE = (
 
 _WATCHER_NO_DIGEST = "\nThe solve-state digest is maintained by the lead session's watcher: always return digest as an empty string."
 
-# Slot "1" is the integration lead; "single" is the only session of a one-worker run. Only their watchers write the digest.
 LEAD_SLOT = "1"
 SINGLE_WORKER_ID = "single"
+
+
+def solver_worker_id(sid: int) -> str:
+    return f"solver{sid}"
 
 
 def _owns_digest(worker_id: str) -> bool:
@@ -260,8 +259,7 @@ def _flag_method_dbg(msg: str) -> None:
         pass
 
 
-def _append_blackboard_info(code: str, worker_id: str, info: str) -> bool:
-    """Write a [flag-method] line to the shared ledger, which keeps one per flag. Returns True if written."""
+def _append_flag_method(code: str, worker_id: str, info: str) -> bool:
     from . import ledger
     info = (info or "").strip()
     if not code or not info:
@@ -343,7 +341,7 @@ def _write_flag_method_once(code: str, worker_id: str, prog: str, activity: str)
         if not info:
             _flag_method_dbg(f"writer exit: compose produced an empty draft worker={worker_id} prog={prog}")
             return
-        ok = _append_blackboard_info(code, worker_id, info)
+        ok = _append_flag_method(code, worker_id, info)
         _flag_method_dbg(f"writer append result ok={ok} worker={worker_id} prog={prog}")
         if ok:
             print(f"[flag-method] session {worker_id} written (progress {prog})", flush=True)
@@ -446,14 +444,24 @@ def _format_ledger_for_watcher(code: str) -> tuple[str, str]:
     return ("\n".join(rows) or "(empty)")[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
 
 
+class Dispute(NamedTuple):
+    id: str
+    reason: str
+
+
+class Supersede(NamedTuple):
+    id: str
+    new_text: str
+
+
 @dataclass(frozen=True)
 class WatcherReply:
     add: tuple[str, ...] = ()
     verify: tuple[str, ...] = ()
-    dispute: tuple[tuple[str, str], ...] = ()    # (entry id, reason)
-    supersede: tuple[tuple[str, str], ...] = ()  # (entry id, corrected text)
+    dispute: tuple[Dispute, ...] = ()
+    supersede: tuple[Supersede, ...] = ()
     digest: str = ""
-    suggest_tasks: tuple[str, ...] = ()          # task board lines
+    suggest_tasks: tuple[str, ...] = ()
     retire_tasks: tuple[str, ...] = ()
 
 
@@ -476,7 +484,6 @@ def _task_line(item) -> str:
 
 
 def parse_watcher_reply(content: str, *, owns_digest: bool) -> Optional[WatcherReply]:
-    """The watcher LLM's JSON reply, minus wrong-typed or empty items (never coerced); limits apply after filtering."""
     s, e = content.find("{"), content.rfind("}")
     if s == -1 or e < s:
         return None
@@ -499,8 +506,8 @@ def parse_watcher_reply(content: str, *, owns_digest: bool) -> Optional[WatcherR
     return WatcherReply(
         add=tuple(add[:3]),
         verify=tuple(_strs("verify")[:5]),
-        dispute=tuple(_pairs("dispute", "reason")[:3]),
-        supersede=tuple(_pairs("supersede", "new")[:3]),
+        dispute=tuple(Dispute(*p) for p in _pairs("dispute", "reason")[:3]),
+        supersede=tuple(Supersede(*p) for p in _pairs("supersede", "new")[:3]),
         digest=_str(obj.get("digest")) if owns_digest else "",
         suggest_tasks=tuple([t for t in map(_task_line, _list("suggest_tasks")) if t][:2]),
         retire_tasks=tuple(_strs("retire_tasks")[:3]),
@@ -508,7 +515,6 @@ def parse_watcher_reply(content: str, *, owns_digest: bool) -> Optional[WatcherR
 
 
 def _apply_watcher_reply(code: str, worker_id: str, reply: WatcherReply) -> dict[str, int]:
-    """One ledger or task-board call per item; the ledger rejects unknown ids, frozen kinds and forbidden moves."""
     from . import ledger
     from .taskboard import publish_task, retire_task
     return {
@@ -523,11 +529,7 @@ def _apply_watcher_reply(code: str, worker_id: str, reply: WatcherReply) -> dict
 
 
 def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None:
-    """LLM reviews recent activity and the ledger: appends entries, marks statuses, rewrites the solving-state digest, publishes directions.
-
-    The ledger (cruiser.ledger) is referenced by id and never deleted; disputes and supersessions are statuses that keep the original text.
-    Also submits flag candidates from the recent activity programmatically as a fallback (the watcher can submit flags too).
-    """
+    """LLM reviews recent activity and the ledger: appends entries, marks statuses, rewrites the solving-state digest, publishes directions."""
     if not code or not activity.strip():
         return
     try:
@@ -804,7 +806,6 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     if resume_id and session["steps"] == 0 and not flag_json:
         ledger.session_clear(code, slot)  # resume produced nothing: start the next session fresh
     if solver_task and not flag_json and session["last_text"].strip() and not ledger.has_result(code, worker_id, solver_task):
-        # the closing message stands in for a conclusion the solver did not report itself
         from .taskboard import report_task
         report_task(code, worker_id, session["last_text"], task=solver_task)
     return flag_json
@@ -1113,7 +1114,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
     code = challenge_code or os.environ.get("CRUISER_CHALLENGE_CODE") or ""
     ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR") or workspace_dir(code, worker_id, resumable=not solver_task)
     os.makedirs(ws_dir, exist_ok=True)
-    os.environ["CRUISER_WORKSPACE_DIR"] = ws_dir  # the prompts and the watcher LLMs read it
+    os.environ["CRUISER_WORKSPACE_DIR"] = ws_dir
 
     # solver directed mode: run only one session, return when done / turn limit reached, no loop
     if solver_task:
