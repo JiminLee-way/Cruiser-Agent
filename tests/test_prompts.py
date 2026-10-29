@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,3 +105,35 @@ def test_prompt_module_carries_no_old_competition_text():
     texts = [v for v in vars(prompt).values() if isinstance(v, str)] + list(prompt.PARTS.values())
     for text in OLD_COMPETITION_TEXT:
         assert not any(text in t for t in texts), text
+
+
+@pytest.fixture
+def watcher_system(tmp_path, monkeypatch):
+    """Return the system message of every watcher LLM call made while running fn."""
+    monkeypatch.setattr(ledger, "_reports_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    seen: list[str] = []
+
+    class FakeLLM:
+        def invoke(self, messages):
+            seen.append(messages[0].content)
+            return SimpleNamespace(content="{}")
+
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+
+    def _calls(fn) -> list[str]:
+        seen.clear()
+        fn()
+        return list(seen)
+
+    return _calls
+
+
+def test_watcher_prompts_require_english(watcher_system, tmp_path):
+    curate = watcher_system(lambda: claude_agent._watcher_curate_blackboard(
+        CODE, "2", "Thought: read the grid", str(tmp_path)))
+    method = watcher_system(lambda: claude_agent._compose_flag_method(
+        "1/1", "Thought: read the grid\nAction: shell: cat grid", str(tmp_path)))
+    assert curate and method
+    assert all("english" in s.lower() for s in curate + method)

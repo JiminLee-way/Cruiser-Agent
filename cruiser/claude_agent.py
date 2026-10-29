@@ -148,6 +148,7 @@ _WATCHER_SYSTEM = (
     "recommend exploration directions that correspond to the open items in the digest. "
     "Never write a concrete flag value into the ledger (there is a fallback auto-submission, so a wrong flag would be submitted again and again). "
     "Do not modify or question [flag-method] entries -- they are written separately by the submitting session on its first successful submission. "
+    "Write every entry, reason, digest and direction in English. "
     "Output only JSON, nothing else."
 )
 
@@ -305,7 +306,7 @@ def _compose_flag_method(prog: str, activity: str, ws_dir: str) -> str:
             )
             _flag_method_dbg(f"compose calling LLM prompt_len={len(prompt)}")
             resp = llm.invoke([
-                SystemMessage(content="Output only one [flag-method] line, no flag value, nothing else."),
+                SystemMessage(content="Output only one [flag-method] line in English, no flag value, nothing else."),
                 HumanMessage(content=prompt),
             ])
             text = resp.content if isinstance(resp.content, str) else ""
