@@ -200,27 +200,25 @@ def _owns_digest(worker_id: str) -> bool:
     return worker_id in (LEAD_SLOT, SINGLE_WORKER_ID)
 
 
-_WATCHER_LLMS: dict[str, object] = {}
+_WATCHER_LLM_BY_WORKSPACE: dict[str, object] = {}
 _WATCHER_LLM_LOCK = threading.Lock()
 
 
 def _get_watcher_llm(ws_dir: str):
-    """Watcher-only LLM, one per workspace (single mode moves to a new workspace per challenge); an engine
-    watcher runs in that workspace. Without an engine: DeepSeek deepseek-v4-pro, overridable via WATCHER_MODEL."""
     with _WATCHER_LLM_LOCK:
-        if _WATCHER_LLMS.get(ws_dir) is None:
+        if _WATCHER_LLM_BY_WORKSPACE.get(ws_dir) is None:
             from . import engines
             eng = engines.current()
             if eng is not None:
                 llm, provider = eng.WatcherLLM(ws_dir), f"{eng.NAME}:{eng.watcher_model()}"
             else:
                 llm, provider, _ = get_watcher_llm()
-            _WATCHER_LLMS[ws_dir] = llm
+            _WATCHER_LLM_BY_WORKSPACE[ws_dir] = llm
             try:
                 print(f"[Watcher] backend model: {provider}", flush=True)
             except Exception:
                 pass
-        return _WATCHER_LLMS[ws_dir]
+        return _WATCHER_LLM_BY_WORKSPACE[ws_dir]
 
 
 def _format_watcher_activity(recent: deque[str] | list[str], budget: int = _WATCHER_ACTIVITY_CHARS) -> str:

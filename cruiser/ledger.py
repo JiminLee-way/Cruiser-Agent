@@ -141,8 +141,6 @@ class _Ledger:
 
 
 class _Writer(_Ledger):
-    """Only _commit creates one, then persists it if changed."""
-
     def __init__(self, led: _Ledger):
         super().__init__(led.entries, led.digest)
         self.changed = False

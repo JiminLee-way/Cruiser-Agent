@@ -1,4 +1,3 @@
-"""The watcher cycle seen from outside a worker: platform submissions, watcher LLM calls, child workspaces."""
 from __future__ import annotations
 
 import json
