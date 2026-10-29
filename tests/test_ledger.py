@@ -41,6 +41,19 @@ def test_duplicates_and_unknown_ids_are_rejected(reports):
     assert not ledger.set_status("T-1", ledger.facts("T-1")[0]["id"], "deleted")
 
 
+def test_one_flag_method_per_flag_number_and_text_duplicates_are_per_kind_group(reports):
+    assert ledger.add_fact("T-1", "1", "progress 1/2. sqli on /login", kind="flag_method")
+    assert ledger.add_fact("T-1", "2", "progress 1/2. ssti on /render", kind="flag_method") is None
+    assert ledger.add_fact("T-1", "2", "progress 2/2. ssti on /render", kind="flag_method")
+    assert ledger.add_fact("T-1", "3", "flag 1 came from sqli on /login")
+    assert ledger.add_fact("T-1", "3", "PROGRESS 1/2.  sqli on /login") is None
+    assert ledger.add_result("T-1", "s1", "check the cookie", "progress 1/2. sqli on /login")
+    assert ledger.add_result("T-1", "s2", "check the cookie", "progress 1/2. sqli on /login") is None
+    assert ledger.add_result("T-1", "s2", "check the login form", "progress 1/2. sqli on /login")
+    assert [f["kind"] for f in ledger.facts("T-1")] == ["flag_method", "flag_method", "fact"]
+    assert [r["task"] for r in ledger.results("T-1")] == ["check the cookie", "check the login form"]
+
+
 def test_board_uses_parseable_header_format(reports):
     ledger.add_fact("T-1", "solver3", "fact one")
     ledger.add_result("T-1", "solver3", "check the table", "table is only a UI legend")
