@@ -9,11 +9,12 @@ import os
 import re
 import time
 import uuid
-from typing import Callable, Literal, Optional, TypedDict, TypeVar
+from typing import Callable, Iterable, Literal, NotRequired, Optional, TypedDict, TypeVar
 
 from .flagshape import PLACEHOLDER, redact
 
 Kind = Literal["fact", "flag_method", "result"]
+Confidence = Literal["observed", "inferred"]
 
 
 class StatusChange(TypedDict):
@@ -29,10 +30,12 @@ class _EntryBase(TypedDict):
     author: str
     text: str
     history: list[StatusChange]
+    basis: NotRequired[list[str]]
 
 
 class FactEntry(_EntryBase):
     kind: Literal["fact", "flag_method"]
+    confidence: NotRequired[Confidence]
 
 
 class ResultEntry(_EntryBase):
@@ -54,6 +57,7 @@ _FROZEN_KINDS = frozenset({"flag_method"})
 _FACT_KINDS = ("fact", "flag_method")
 _KIND_TAG = {"fact": "", "flag_method": "[flag-method] ", "result": "[task-result] "}
 _STATUS_TAG = {"verified": "[verified] ", "disputed": "[disputed] "}
+_CONFIDENCE_TAG: dict[Confidence, str] = {"observed": "", "inferred": "[inferred] "}
 _ID_PREFIX = {"fact": "f", "flag_method": "f", "result": "r"}
 _TEXT_CAP = {"fact": 400, "flag_method": 400, "result": 1500}
 _NOTE_CAP = 300
@@ -131,6 +135,10 @@ class _Ledger:
     def live(self, kinds: tuple[str, ...] = tuple(_KIND_TAG)) -> list[Entry]:
         return [e for e in self.entries if e["kind"] in kinds and _status(e) != "superseded"]
 
+    def live_ids(self, ids: Iterable[str]) -> list[str]:
+        live = {e["id"] for e in self.live()}
+        return [i for i in dict.fromkeys(ids) if i in live]
+
     def same_text(self, kind: Kind, text: str, task: str) -> Optional[Entry]:
         group = ("result",) if kind == "result" else _FACT_KINDS
         return next((e for e in self.live(group) if _norm(e["text"]) == _norm(text) and e.get("task", "") == task), None)
@@ -145,7 +153,8 @@ class _Writer(_Ledger):
         super().__init__(led.entries, led.digest)
         self.changed = False
 
-    def add(self, author: str, kind: Kind, text: str, task: str = "") -> Optional[str]:
+    def add(self, author: str, kind: Kind, text: str, task: str = "", basis: Iterable[str] = (),
+            confidence: Optional[Confidence] = None) -> Optional[str]:
         text = _clean(text, _TEXT_CAP[kind])
         task = _clean(task, _TASK_CAP) if kind == "result" else ""
         if not text or self.same_text(kind, text, task) or (kind == "flag_method" and self.same_flag(text)):
@@ -156,6 +165,10 @@ class _Writer(_Ledger):
         entry: Entry = {"id": eid, "ts": _now(), "author": author, "kind": kind, "text": text, "history": []}
         if kind == "result":
             entry["task"] = task
+        if kept := self.live_ids(basis):
+            entry["basis"] = kept
+        if confidence:
+            entry["confidence"] = confidence
         self.entries.append(entry)
         self.changed = True
         return eid
@@ -225,11 +238,16 @@ def _write_atomic(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
+def basis_suffix(ids: list[str]) -> str:
+    return f" (from {', '.join(ids)})" if ids else ""
+
+
 def _view_line(e: Entry) -> str:
     body = f"{e['task'][:80]} -> {e['text']}" if e.get("task") else e["text"]
     notes = _notes(e)
     tail = f" ({'; '.join(notes)})" if notes else ""
-    return _flatten(f"{_KIND_TAG[e['kind']]}{_STATUS_TAG.get(_status(e), '')}{e['id']} {body}{tail}")
+    tags = f"{_KIND_TAG[e['kind']]}{_STATUS_TAG.get(_status(e), '')}{_CONFIDENCE_TAG.get(e.get('confidence'), '')}"
+    return _flatten(f"{tags}{e['id']} {body}{tail}{basis_suffix(e.get('basis', []))}")
 
 
 def _render(led: _Ledger) -> str:
@@ -251,9 +269,11 @@ def _commit(code: str, change: Callable[[_Writer], T]) -> T:
 
 def _public(e: Entry) -> dict:
     out = {"id": e["id"], "ts": e["ts"], "author": e["author"], "kind": e["kind"], "text": e["text"],
-           "status": _status(e), "notes": _notes(e)}
+           "status": _status(e), "notes": _notes(e), "basis": e.get("basis", [])}
     if e["kind"] == "result":
         out["task"] = e["task"]
+    else:
+        out["confidence"] = e.get("confidence", "")
     return out
 
 
@@ -271,16 +291,17 @@ def results(code: str, include_superseded: bool = False) -> list[dict]:
     return _entries(code, ("result",), include_superseded)
 
 
-def add_fact(code: str, author: str, text: str, kind: Kind = "fact") -> Optional[str]:
+def add_fact(code: str, author: str, text: str, kind: Kind = "fact", basis: Iterable[str] = (),
+             confidence: Optional[Confidence] = None) -> Optional[str]:
     if not code:
         return None
-    return _commit(code, lambda led: led.add(author, kind, text))
+    return _commit(code, lambda led: led.add(author, kind, text, basis=basis, confidence=confidence))
 
 
-def add_result(code: str, author: str, task: str, text: str) -> Optional[str]:
+def add_result(code: str, author: str, task: str, text: str, basis: Iterable[str] = ()) -> Optional[str]:
     if not code:
         return None
-    return _commit(code, lambda led: led.add(author, "result", text, task))
+    return _commit(code, lambda led: led.add(author, "result", text, task, basis=basis))
 
 
 def has_result(code: str, author: str, task: str) -> bool:

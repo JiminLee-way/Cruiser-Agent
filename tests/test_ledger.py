@@ -237,3 +237,52 @@ def test_codex_defaults_to_gpt_6_sol_with_daybreak_on_every_call(monkeypatch):
     monkeypatch.setenv("CRUISER_CODEX_DAYBREAK", "0")
     for role, cmd in _codex_cmds(monkeypatch).items():
         assert "daybreak=true" not in cmd, role
+
+
+def _board_line(reports, entry_id: str) -> str:
+    board = (reports / "info_T-1.txt").read_text(encoding="utf-8")
+    return next(ln for ln in board.splitlines() if f" {entry_id} " in ln)
+
+
+def test_basis_keeps_only_ids_of_live_entries(reports):
+    known = ledger.add_fact("T-1", "1", "admin cookie is base64 json")
+    old = ledger.add_fact("T-1", "1", "key is 16 bytes")
+    ledger.supersede("T-1", old, "key is 16 bytes, big-endian", "2")
+    rid = ledger.add_result("T-1", "solver1", "forge the cookie", "forged admin cookie accepted",
+                            basis=[known, "f-unknwn", old, known])
+    [r] = ledger.results("T-1")
+    assert r["id"] == rid and r["basis"] == [known]
+    assert _board_line(reports, rid).endswith(f" (from {known})")
+    plain = ledger.add_fact("T-1", "1", "login form posts to /auth", basis=["f-unknwn"])
+    assert next(f for f in ledger.facts("T-1") if f["id"] == plain)["basis"] == []
+    assert "(from" not in _board_line(reports, plain)
+
+
+def test_inferred_fact_is_tagged_after_its_status(reports):
+    inferred = ledger.add_fact("T-1", "1", "the PRNG is seeded from the table", confidence="inferred")
+    observed = ledger.add_fact("T-1", "1", "the table has 256 rows", confidence="observed")
+    ledger.set_status("T-1", inferred, "verified", by="2")
+    assert f"[verified] [inferred] {inferred} " in _board_line(reports, inferred)
+    assert "[inferred]" not in _board_line(reports, observed) and "[observed]" not in _board_line(reports, observed)
+    assert {f["id"]: f["confidence"] for f in ledger.facts("T-1")} == {inferred: "inferred", observed: "observed"}
+
+
+@pytest.mark.parametrize("status", ["open", "verified", "disputed"])
+def test_dashboard_classifies_every_kind_with_basis_and_confidence(reports, status):
+    expected = {"fact": "fact", "flag_method": "flag_method", "result": "task_report"}
+    base = ledger.add_fact("T-1", "1", "base fact for basis")
+    ids = {}
+    for kind in ("fact", "flag_method"):
+        for i, (basis, confidence) in enumerate([([], None), ([base], None), ([base], "inferred"), ([], "observed")]):
+            ids[ledger.add_fact("T-1", "1", f"progress {len(ids) + 1}/9. {kind} variant {i}", kind=kind,
+                                basis=basis, confidence=confidence)] = kind
+    for i, basis in enumerate([[], [base]]):
+        ids[ledger.add_result("T-1", "solver1", f"direction {i}", f"result variant {i}", basis=basis)] = "result"
+    if status != "open":
+        for eid in ids:
+            ledger.set_status("T-1", eid, status, f"{status} by replay", "2")
+    entries = runtime.parse_blackboard((reports / "info_T-1.txt").read_text(encoding="utf-8"))
+    assert len(entries) == len(ids) + 1
+    for eid, kind in ids.items():
+        [e] = [e for e in entries if eid in e["info"].split()]
+        assert e["kind"] == expected[kind], e["info"]
