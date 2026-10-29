@@ -190,7 +190,7 @@ sequenceDiagram
 
 | Area | Choice | Rationale |
 |------|--------|-----------|
-| Agent runtime | `claude` CLI (stream-json headless mode) | Mature tool-call loop, context compaction, and hook mechanism; avoids the reliability problems of a home-grown ReAct loop (the old hand-written ReAct engine `cruiser/agent.py` is deprecated and kept for reference) |
+| Agent runtime | `claude` CLI (stream-json headless mode) | Mature tool-call loop, context compaction, and hook mechanism; avoids the reliability problems of a home-grown ReAct loop |
 | Solving model | DeepSeek (default `deepseek-v4-flash`) | Wired in through the Anthropic-compatible endpoint, 1M context window |
 | Curation model | `deepseek-v4-pro` | Blackboard curation and direction planning need stronger reasoning |
 | Inter-process communication | File system + `fcntl` locks + `os.replace` | No external dependencies, good crash consistency, human-inspectable |
@@ -226,8 +226,7 @@ Cruiser/
 │   ├── taskboard.py         # Task board read/write (file lock + atomic rewrite)
 │   ├── llm.py               # LLM provider registry and routing (DeepSeek / Kimi / GLM)
 │   ├── prompt.py            # System prompts and task templates
-│   ├── tools.py             # submit_flag, dirsearch/xss and other tools
-│   └── agent.py             # Legacy hand-written ReAct engine (deprecated, kept for reference)
+│   └── tools.py             # submit_flag, dirsearch/xss and other tools
 ├── resource/                # Username/password/XSS payload/flag clue wordlists
 ├── kb/                      # Offline vulnerability knowledge base (git submodules: vulhub / nuclei-templates / PayloadsAllTheThings; download the nuclei binary yourself)
 ├── tests/                   # pytest: local platform, flag submission, scheduler smoke test
