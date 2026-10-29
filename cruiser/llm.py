@@ -6,50 +6,50 @@ from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# LLM 提供方配置（单一事实源，表驱动）
+# LLM provider configuration (single source of truth, table-driven)
 #
-# 原则：
-#   1. 所有密钥一律从环境变量读取（可在项目根目录 .env 配置），源码中不含任何硬编码密钥。
-#   2. 提供方（provider）由「模型名前缀」映射决定，见 MODEL_PREFIX_TO_PROVIDER。
-#   3. 每个提供方的端点/密钥环境变量集中登记在 PROVIDERS 注册表里；
-#      新接一家：在 PROVIDERS 增一条 + 在 MODEL_PREFIX_TO_PROVIDER 增前缀即可，无需改调用方。
+# Principles:
+#   1. All keys are read from environment variables (configurable in the project-root .env); the source contains no hard-coded keys.
+#   2. The provider is determined by a "model name prefix" mapping, see MODEL_PREFIX_TO_PROVIDER.
+#   3. Each provider's endpoints/key environment variables are registered centrally in the PROVIDERS registry;
+#      to add a provider: add one entry to PROVIDERS + add its prefix to MODEL_PREFIX_TO_PROVIDER; callers need no changes.
 #
-# 当前登记：
-#   - deepseek：解题引擎(claude CLI) 与 watcher 默认；
-#   - kimi(moonshot)：worker/watcher 指定 kimi-* 模型时自动路由；
-#   - glm(腾讯 TokenHub)：worker/watcher 指定 glm-* 模型时自动路由。
-#   端点默认为各家官方 https 地址，均可用对应 *_BASE_URL 环境变量覆盖。
+# Currently registered:
+#   - deepseek: default for the solving engine (claude CLI) and the watcher;
+#   - kimi (moonshot): routed automatically when the worker/watcher specifies a kimi-* model;
+#   - glm (Tencent TokenHub): routed automatically when the worker/watcher specifies a glm-* model.
+#   Endpoints default to each vendor's official https address and can be overridden with the matching *_BASE_URL environment variable.
 # ---------------------------------------------------------------------------
 
-# 默认模型（可分别用环境变量覆盖）
-DEFAULT_SOLVE_MODEL = "deepseek-v4-flash"     # 解题引擎默认模型
-DEFAULT_WATCHER_MODEL = "deepseek-v4-pro"     # 黑板 watcher 默认模型（策展需更强推理）
+# Default models (each can be overridden with an environment variable)
+DEFAULT_SOLVE_MODEL = "deepseek-v4-flash"     # default model for the solving engine
+DEFAULT_WATCHER_MODEL = "deepseek-v4-pro"     # default model for the blackboard watcher (curation needs stronger reasoning)
 
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """一家 LLM 提供方的接入配置。端点地址支持用对应环境变量覆盖默认值。"""
+    """Connection settings for one LLM provider. Endpoint defaults can be overridden with the matching environment variables."""
     name: str
-    api_key_env: str              # 密钥环境变量名
-    anthropic_base_url: str       # Anthropic 兼容端点默认地址（claude CLI 用）
-    openai_base_url: str          # OpenAI 兼容端点默认地址（langchain watcher 用）
-    anthropic_base_url_env: str   # 覆盖 Anthropic 端点的环境变量名
-    openai_base_url_env: str      # 覆盖 OpenAI 端点的环境变量名
-    max_context_tokens: int = 1_000_000    # 模型真实上下文窗口（供 claude CLI 校正 auto-compact）
-    auto_compact_window: int = 800_000     # 提前触发上下文压缩的阈值
+    api_key_env: str              # name of the key environment variable
+    anthropic_base_url: str       # default Anthropic-compatible endpoint (used by the claude CLI)
+    openai_base_url: str          # default OpenAI-compatible endpoint (used by the langchain watcher)
+    anthropic_base_url_env: str   # environment variable that overrides the Anthropic endpoint
+    openai_base_url_env: str      # environment variable that overrides the OpenAI endpoint
+    max_context_tokens: int = 1_000_000    # the model's real context window (lets the claude CLI calibrate auto-compact)
+    auto_compact_window: int = 800_000     # threshold for triggering context compaction early
 
 
 def _resolve_anthropic_base_url(cfg: "ProviderConfig") -> str:
-    """Anthropic 端点解析：显式环境变量覆盖 > 默认官方端点。"""
+    """Resolve the Anthropic endpoint: explicit environment override > default official endpoint."""
     return os.environ.get(cfg.anthropic_base_url_env) or cfg.anthropic_base_url
 
 
 def _resolve_openai_base_url(cfg: "ProviderConfig") -> str:
-    """OpenAI 兼容端点解析：显式环境变量覆盖 > 默认官方端点。"""
+    """Resolve the OpenAI-compatible endpoint: explicit environment override > default official endpoint."""
     return os.environ.get(cfg.openai_base_url_env) or cfg.openai_base_url
 
 
-# 提供方注册表：provider 名 -> 配置
+# Provider registry: provider name -> config
 PROVIDERS: dict[str, ProviderConfig] = {
     "deepseek": ProviderConfig(
         name="deepseek",
@@ -59,7 +59,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         anthropic_base_url_env="ANTHROPIC_BASE_URL",
         openai_base_url_env="DEEPSEEK_BASE_URL",
     ),
-    # Kimi / Moonshot（国内域名；国际站为 api.moonshot.ai，可用下列 *_env 覆盖）
+    # Kimi / Moonshot (China domain; the international site is api.moonshot.ai, override with the *_env settings below)
     "kimi": ProviderConfig(
         name="kimi",
         api_key_env="KIMI_API_KEY",
@@ -68,9 +68,9 @@ PROVIDERS: dict[str, ProviderConfig] = {
         anthropic_base_url_env="KIMI_ANTHROPIC_BASE_URL",
         openai_base_url_env="KIMI_BASE_URL",
     ),
-    # GLM（智谱）经腾讯 TokenHub 聚合网关：统一兼容 Anthropic Messages 与 OpenAI Chat 协议。
-    # Anthropic 协议鉴权头为 x-api-key（与 ANTHROPIC_AUTH_TOKEN 发送方式一致）；
-    # OpenAI 协议为 Authorization: Bearer（langchain ChatOpenAI 默认）。key 通用。
+    # GLM (Zhipu) via the Tencent TokenHub aggregation gateway: compatible with both the Anthropic Messages and OpenAI Chat protocols.
+    # The Anthropic protocol auth header is x-api-key (sent the same way as ANTHROPIC_AUTH_TOKEN);
+    # the OpenAI protocol uses Authorization: Bearer (the langchain ChatOpenAI default). The same key works for both.
     "glm": ProviderConfig(
         name="glm",
         api_key_env="GLM_API_KEY",
@@ -78,15 +78,15 @@ PROVIDERS: dict[str, ProviderConfig] = {
         openai_base_url="https://tokenhub.tencentmaas.com/v1",
         anthropic_base_url_env="GLM_ANTHROPIC_BASE_URL",
         openai_base_url_env="GLM_BASE_URL",
-        # TokenHub 文档：glm-5.3 / glm-5.2 上下文 1M、最大输出 128K，与 DeepSeek 同规格。
-        # 注意 glm-5.1 / glm-5 / glm-5-turbo 仅 200K：使用这些老模型时请显式设置
-        # CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000（与 AUTO_COMPACT_WINDOW 相应调低）。
+        # TokenHub docs: glm-5.3 / glm-5.2 have a 1M context and 128K max output, the same as DeepSeek.
+        # Note glm-5.1 / glm-5 / glm-5-turbo only have 200K: when using these older models, explicitly set
+        # CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000 (and lower AUTO_COMPACT_WINDOW accordingly).
         max_context_tokens=1_000_000,
         auto_compact_window=800_000,
     ),
 }
 
-# 模型名前缀 -> 提供方（小写匹配）。命中即路由到该提供方；都不命中用 DEFAULT_PROVIDER。
+# Model name prefix -> provider (lowercase match). A hit routes to that provider; otherwise DEFAULT_PROVIDER is used.
 MODEL_PREFIX_TO_PROVIDER: dict[str, str] = {
     "deepseek": "deepseek",
     "kimi": "kimi",
@@ -101,16 +101,16 @@ _GLM_MODEL_RE = re.compile(r"^glm-?(\d.*)$", re.IGNORECASE)
 
 
 def _normalize_glm_model(model: str) -> str:
-    """glm 模型名规范化：TokenHub 模型 ID 为 glm-5.3 形式，容忍 glm5.3 / GLM5.3 写法。"""
+    """Normalize glm model names: TokenHub model IDs look like glm-5.3; glm5.3 / GLM5.3 spellings are tolerated."""
     m = _GLM_MODEL_RE.match((model or "").strip())
     return f"glm-{m.group(1)}" if m else model
 
 
 # ---------------------------------------------------------------------------
-# 提供方解析
+# Provider resolution
 # ---------------------------------------------------------------------------
 def provider_for_model(model: str) -> str:
-    """按模型名判定提供方：命中 MODEL_PREFIX_TO_PROVIDER 中任一前缀即用其映射，否则默认。"""
+    """Determine the provider from the model name: use the mapping of any matching prefix in MODEL_PREFIX_TO_PROVIDER, otherwise the default."""
     m = (model or "").lower()
     for prefix, provider in MODEL_PREFIX_TO_PROVIDER.items():
         if m.startswith(prefix) or prefix in m:
@@ -127,25 +127,25 @@ def _provider_api_key(cfg: ProviderConfig) -> str:
 
 
 def get_deepseek_api_key() -> str:
-    """DeepSeek 密钥（仅从环境变量读取，缺失返回空串）。"""
+    """DeepSeek key (read only from the environment; empty string if missing)."""
     return _provider_api_key(PROVIDERS["deepseek"])
 
 
 def get_kimi_api_key() -> str:
-    """Kimi / Moonshot 密钥（仅从环境变量读取，缺失返回空串）。"""
+    """Kimi / Moonshot key (read only from the environment; empty string if missing)."""
     return _provider_api_key(PROVIDERS["kimi"])
 
 
 def get_glm_api_key() -> str:
-    """GLM（腾讯 TokenHub）密钥（仅从环境变量读取，缺失返回空串）。"""
+    """GLM (Tencent TokenHub) key (read only from the environment; empty string if missing)."""
     return _provider_api_key(PROVIDERS["glm"])
 
 
 def get_solve_model() -> str:
-    """解题引擎（claude CLI）使用的模型。
+    """Model used by the solving engine (claude CLI).
 
-    优先级：CRUISER_MODEL > ANTHROPIC_MODEL > DEEPSEEK_MODEL > 默认。
-    glm 系模型名做规范化（glm5.3 -> glm-5.3），以匹配 TokenHub 的模型 ID。
+    Priority: CRUISER_MODEL > ANTHROPIC_MODEL > DEEPSEEK_MODEL > default.
+    glm-family model names are normalized (glm5.3 -> glm-5.3) to match TokenHub model IDs.
     """
     model = os.environ.get("CRUISER_MODEL") or os.environ.get("ANTHROPIC_MODEL") or os.environ.get("DEEPSEEK_MODEL") or DEFAULT_SOLVE_MODEL
     if provider_for_model(model) == "glm":
@@ -154,7 +154,7 @@ def get_solve_model() -> str:
 
 
 def get_watcher_model() -> str:
-    """黑板 watcher 使用的模型（WATCHER_MODEL 覆盖，默认 deepseek-v4-pro）。glm 系做规范化。"""
+    """Model used by the blackboard watcher (overridden by WATCHER_MODEL, default deepseek-v4-pro). glm-family names are normalized."""
     model = os.environ.get("WATCHER_MODEL", DEFAULT_WATCHER_MODEL)
     if provider_for_model(model) == "glm":
         return _normalize_glm_model(model)
@@ -162,25 +162,25 @@ def get_watcher_model() -> str:
 
 
 def get_context_defaults(model: str) -> tuple[int, int]:
-    """返回 (最大上下文 token 数, auto-compact 触发窗口) 的提供方默认值。
+    """Return the provider defaults for (max context tokens, auto-compact trigger window).
 
-    供 claude_agent._claude_env 对 CLAUDE_CODE_MAX_CONTEXT_TOKENS /
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW 做 setdefault：DeepSeek 1M 窗口，GLM 约 200K。
-    用户显式设置的环境变量始终优先。
+    Used by claude_agent._claude_env to setdefault CLAUDE_CODE_MAX_CONTEXT_TOKENS /
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: DeepSeek has a 1M window, GLM about 200K.
+    Environment variables set explicitly by the user always take precedence.
     """
     cfg = get_provider_config(provider_for_model(model))
     return cfg.max_context_tokens, cfg.auto_compact_window
 
 
 # ---------------------------------------------------------------------------
-# 解题引擎：claude CLI 的 Anthropic 兼容端点配置
+# Solving engine: Anthropic-compatible endpoint config for the claude CLI
 # ---------------------------------------------------------------------------
 def get_claude_provider_env() -> dict[str, str]:
-    """返回 claude CLI 接入 Anthropic 兼容端点所需的环境变量。
+    """Return the environment variables the claude CLI needs to reach an Anthropic-compatible endpoint.
 
-    只负责"连哪个模型/端点/用哪把 key"这一层；claude 运行期开关（沙箱、上下文
-    压缩窗口、逆向环境等）由 claude_agent._claude_env 负责，二者职责分离。
-    提供方按模型名自动路由；密钥取该提供方密钥，缺失时回退显式的 ANTHROPIC_AUTH_TOKEN。
+    Responsible only for "which model/endpoint/key to use"; claude runtime switches (sandbox, context
+    compaction window, reversing environment, etc.) are handled by claude_agent._claude_env; the two are kept separate.
+    The provider is routed automatically by model name; the key is that provider's key, falling back to an explicit ANTHROPIC_AUTH_TOKEN when missing.
     """
     model = get_solve_model()
     cfg = get_provider_config(provider_for_model(model))
@@ -195,13 +195,13 @@ def get_claude_provider_env() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# langchain（watcher / 旧 ReAct 引擎）：OpenAI 兼容端点
+# langchain (watcher / legacy ReAct engine): OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
 def _compute_temperature() -> float:
-    """根据并发会话编号与总数，按序号从低到高分配温度（仅 langchain 路径使用）。
+    """Assign temperatures from low to high by session index, based on the concurrent session ID and count (langchain path only).
 
-    - 当 CRUISER_SESSIONS<=1 或未设置时，返回 CRUISER_TEMP_MIN（默认 0.0）。
-    - 线性区间 [CRUISER_TEMP_MIN, CRUISER_TEMP_MAX]，按 worker_id 在 [1..sessions] 等分。
+    - When CRUISER_SESSIONS<=1 or unset, returns CRUISER_TEMP_MIN (default 0.0).
+    - Linear range [CRUISER_TEMP_MIN, CRUISER_TEMP_MAX], split evenly by worker_id over [1..sessions].
     """
     try:
         wid = int(os.environ.get("CRUISER_WORKER_ID", "1") or "1")
@@ -228,11 +228,11 @@ def _compute_temperature() -> float:
 
 
 def _build_chat_openai(model: str, temperature: Optional[float]) -> Optional[Any]:
-    """构造一个 OpenAI 兼容的 langchain ChatOpenAI 实例（watcher / 旧引擎用）。
+    """Build an OpenAI-compatible langchain ChatOpenAI instance (for the watcher / legacy engine).
 
-    提供方按模型名自动路由（端点与密钥取自 PROVIDERS 注册表）。
-    无密钥或依赖缺失/构造失败时返回 None（不抛异常）。
-    temperature 为 None 时不传该参数（交由服务端默认）。
+    The provider is routed automatically by model name (endpoint and key come from the PROVIDERS registry).
+    Returns None (without raising) when there is no key, a dependency is missing, or construction fails.
+    When temperature is None the parameter is not passed (the server default applies).
     """
     cfg = get_provider_config(provider_for_model(model))
     key = _provider_api_key(cfg)
@@ -253,10 +253,10 @@ def _build_chat_openai(model: str, temperature: Optional[float]) -> Optional[Any
 
 
 def get_llm() -> Tuple[Optional[Any], str, bool]:
-    """解题用 langchain 模型（旧 ReAct 引擎路径；当前主引擎为 claude CLI，通常不走此处）。
+    """langchain model for solving (legacy ReAct engine path; the main engine is now the claude CLI, so this is usually not used).
 
-    返回三元组 (llm, provider, supports_tool_calls)；无可用密钥/依赖时返回 (None, "none", False)。
-    标记不支持原生 tool calling，走 JSON 决策路径。
+    Returns a triple (llm, provider, supports_tool_calls); returns (None, "none", False) when no key/dependency is available.
+    Marked as not supporting native tool calling, so the JSON decision path is used.
     """
     model = os.environ.get("DEEPSEEK_MODEL", DEFAULT_SOLVE_MODEL)
     llm = _build_chat_openai(model, _compute_temperature())
@@ -266,10 +266,10 @@ def get_llm() -> Tuple[Optional[Any], str, bool]:
 
 
 def get_watcher_llm() -> Tuple[Optional[Any], str, bool]:
-    """黑板 watcher（策展/任务发布）专用 LLM，默认 DeepSeek deepseek-v4-pro（WATCHER_MODEL 覆盖）。
+    """Dedicated LLM for the blackboard watcher (curation/task publishing), default DeepSeek deepseek-v4-pro (overridden by WATCHER_MODEL).
 
-    模型为 kimi-* 时自动走 Kimi 端点。WATCHER_TEMPERATURE 未设置时不传温度。
-    无密钥时回退 get_llm()。
+    kimi-* models go to the Kimi endpoint automatically. No temperature is passed when WATCHER_TEMPERATURE is unset.
+    Falls back to get_llm() when there is no key.
     """
     temp_env = os.environ.get("WATCHER_TEMPERATURE", "").strip()
     try:

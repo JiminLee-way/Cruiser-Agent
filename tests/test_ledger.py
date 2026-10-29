@@ -1,0 +1,145 @@
+"""Shared ledger, engine resume commands and session-id events."""
+from __future__ import annotations
+
+import io
+import json
+import multiprocessing as mp
+
+import pytest
+
+from cruiser import codex_engine, ledger, opencode_engine
+
+
+@pytest.fixture
+def reports(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger, "_reports_dir", lambda: str(tmp_path))
+    return tmp_path
+
+
+def test_disputed_entry_keeps_text_and_reason(reports):
+    fid = ledger.add_fact("T-1", "1", "lead: seed 0x1234 matches the known prefix")
+    assert ledger.set_status("T-1", fid, "disputed", "not the seed of the solved grid", "w2")
+    [f] = ledger.facts("T-1")
+    assert f["status"] == "disputed"
+    assert "seed 0x1234" in f["text"]
+    assert any("not the seed of the solved grid" in n for n in f["notes"])
+    board = (reports / "info_T-1.txt").read_text(encoding="utf-8")
+    assert "[disputed]" in board and "seed 0x1234" in board
+
+
+def test_supersede_hides_old_entry_but_keeps_it_in_ledger(reports):
+    old = ledger.add_fact("T-1", "1", "key is 16 bytes")
+    new = ledger.supersede("T-1", old, "key is 16 bytes, big-endian", "w")
+    assert [f["id"] for f in ledger.facts("T-1")] == [new]
+    assert {f["id"] for f in ledger.facts("T-1", include_superseded=True)} == {old, new}
+
+
+def test_duplicates_and_unknown_ids_are_rejected(reports):
+    assert ledger.add_fact("T-1", "1", "A  b") is not None
+    assert ledger.add_fact("T-1", "2", "a b") is None
+    assert not ledger.set_status("T-1", "f-nope00", "verified")
+    assert not ledger.set_status("T-1", ledger.facts("T-1")[0]["id"], "deleted")
+
+
+def test_board_uses_parseable_header_format(reports):
+    ledger.add_fact("T-1", "solver3", "fact one")
+    ledger.add_result("T-1", "solver3", "check the table", "table is only a UI legend")
+    lines = (reports / "info_T-1.txt").read_text(encoding="utf-8").splitlines()
+    assert lines[0].endswith("session: solver3") and lines[1].startswith("info: ")
+    assert any(ln.startswith("info: [task-result]") for ln in lines)
+
+
+def test_context_text_puts_digest_first_and_respects_budget(reports):
+    for i in range(200):
+        ledger.add_fact("T-1", "1", f"entry number {i} " + "x" * 40)
+    ledger.set_digest("T-1", "w", "GOAL: get DH{...}\nOPEN LEADS: seed candidate")
+    text = ledger.context_text("T-1", budget=1500)
+    assert text.startswith("[Solve state")
+    assert len(text) <= 1500
+    assert "entry number 199" in text and "entry number 0 " not in text
+
+
+def _writer(path: str, n: int, tag: str) -> None:
+    from cruiser import ledger as lg
+    lg._reports_dir = lambda: path
+    for i in range(n):
+        lg.add_fact("T-1", tag, f"{tag} fact {i}")
+
+
+def test_concurrent_writers_do_not_lose_entries(reports):
+    procs = [mp.Process(target=_writer, args=(str(reports), 15, f"w{k}")) for k in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+    assert len(ledger.facts("T-1")) == 60
+    raw = (reports / "ledger_T-1.jsonl").read_text(encoding="utf-8").splitlines()
+    assert all(json.loads(x) for x in raw)
+
+
+def test_session_slots(reports):
+    assert ledger.session_get("T-1", "1") is None
+    ledger.session_set("T-1", "1", "codex", "thread-a")
+    ledger.session_set("T-1", "2", "codex", "thread-b")
+    assert ledger.session_get("T-1", "1")["id"] == "thread-a"
+    ledger.session_clear("T-1", "1")
+    assert ledger.session_get("T-1", "1") is None
+    assert ledger.session_get("T-1", "2")["id"] == "thread-b"
+
+
+def test_codex_resume_cmd(monkeypatch):
+    monkeypatch.setattr(codex_engine, "binary", lambda: "codex")
+    monkeypatch.setenv("CRUISER_CODEX_DAYBREAK", "1")
+    monkeypatch.setenv("CRUISER_CODEX_SANDBOX", "danger-full-access")
+    cmd = codex_engine.resume_cmd("tid", "go on", ws_dir="/w", reports_dir="/r", model="gpt-6-sol")
+    assert cmd[:3] == ["codex", "exec", "resume"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in cmd and "daybreak=true" in cmd
+    assert cmd[-2:] == ["tid", "go on"] and "-C" not in cmd
+    monkeypatch.delenv("CRUISER_CODEX_SANDBOX")
+    monkeypatch.setenv("CRUISER_CODEX_ROOT", "/root")
+    cmd = codex_engine.resume_cmd("tid", "go on", ws_dir="/w", reports_dir="/r", model="m")
+    roots = next(c for c in cmd if c.startswith("sandbox_workspace_write.writable_roots="))
+    assert json.loads(roots.split("=", 1)[1]) == ["/root", "/r", "/w"]
+
+
+def test_engines_announce_session_ids():
+    codex_out = io.StringIO('{"type":"thread.started","thread_id":"t-1"}\n{"type":"turn.completed"}\n')
+    first = next(iter(codex_engine.claude_events(codex_out)))
+    assert first == {"type": "system", "subtype": "init", "session_id": "t-1"}
+    oc_out = io.StringIO('{"type":"text","sessionID":"ses_1","part":{"text":"hi"}}\n')
+    evs = list(opencode_engine.claude_events(oc_out))
+    assert evs[0]["session_id"] == "ses_1" and evs[1]["type"] == "assistant"
+    assert opencode_engine.resume_cmd.__name__ and "--session" in opencode_engine._run_cmd("m", "x", "ses_1")
+
+
+def test_watcher_applies_statuses_by_id_and_never_deletes(reports, monkeypatch):
+    from cruiser import claude_agent, taskboard
+    monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
+    lead = ledger.add_fact("T-1", "solver11", "lead: seed 0xab5e313b gives the known prefix")
+    keep = ledger.add_fact("T-1", "1", "bytecode is 2200 records of 8 bytes")
+    reply = {
+        "add": ["grid columns 0-3 are [1, 2, 3, 4]", "flag{should_never_be_stored_here}"],
+        "verify": [keep, "f-unknwn"],
+        "dispute": [{"id": lead, "reason": "not the seed of the solved grid"}],
+        "supersede": [],
+        "digest": "GOAL: DH{...}\nOPEN LEADS: f-lead seed",
+        "suggest_tasks": [{"text": "derive the output from the seed lead", "basis": lead}],
+        "retire_tasks": [],
+    }
+
+    class FakeLLM:
+        def invoke(self, messages):
+            class R:
+                content = json.dumps(reply)
+            return R()
+
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
+    claude_agent._watcher_curate_blackboard("T-1", "w1", "Thought: tried things\nAction: shell: ls")
+    by_id = {f["id"]: f for f in ledger.facts("T-1")}
+    assert by_id[lead]["status"] == "disputed" and "0xab5e313b" in by_id[lead]["text"]
+    assert by_id[keep]["status"] == "verified"
+    texts = [f["text"] for f in by_id.values()]
+    assert "grid columns 0-3 are [1, 2, 3, 4]" in texts
+    assert not any("should_never_be_stored_here" in t for t in texts)
+    assert ledger.digest("T-1").startswith("GOAL")
+    assert any(lead in t["text"] for t in taskboard.list_tasks("T-1"))

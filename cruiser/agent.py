@@ -19,33 +19,33 @@ from .prompt import (
 )
 
 # ------------------------------
-# 启动时获取可用安全工具概览
+# Fetch an overview of available security tools at startup
 # ------------------------------
 _SECURITY_TOOLS_OVERVIEW: str = ""
 
 def _refresh_security_tools_overview() -> None:
-    """调用 list_security_tools_tool 获取当前环境可用的命令行安全工具，并生成简短概览。
-    概览会被注入到 system prompt，帮助模型更好地理解环境能力；同时在启动时打印到控制台（绿色）。
+    """Call list_security_tools_tool to get the command-line security tools available in this environment and build a short overview.
+    The overview is injected into the system prompt to help the model understand the environment's capabilities; it is also printed to the console (green) at startup.
     """
     global _SECURITY_TOOLS_OVERVIEW
     try:
-        # 调用工具
+        # Invoke the tool
         txt = list_security_tools_tool.invoke({"only_available": True, "with_version": True})
 
-        # 将结果先落盘到文件，再从文件读取（便于审计与复用）
+        # Write the result to a file first, then read it back (for auditing and reuse)
         try:
             out_dir = os.path.join(os.getcwd(), "reports")
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, "list_security_tools.json")
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(txt if isinstance(txt, str) else str(txt))
-            # 回读
+            # Read back
             with open(out_path, "r", encoding="utf-8") as f:
                 txt = f.read()
         except Exception:
-            # 文件落盘失败不影响主流程
+            # Failing to write the file does not affect the main flow
             pass
-        summary = "无"
+        summary = "none"
         try:
             arr = json.loads(txt)
             if isinstance(arr, list):
@@ -54,36 +54,36 @@ def _refresh_security_tools_overview() -> None:
                     name = (t or {}).get("name") or ""
                     ver = (t or {}).get("version") or ""
                     items.append(name + (f" ({ver})" if ver else ""))
-                summary = ", ".join([s for s in items if s]) or "无"
+                summary = ", ".join([s for s in items if s]) or "none"
         except Exception:
-            # 若返回不是 JSON，保底显示原文本的首行
+            # If the result is not JSON, fall back to showing the first line of the raw text
             line = (txt or "").strip().splitlines()[:1]
-            summary = line[0] if line else "无"
+            summary = line[0] if line else "none"
         _SECURITY_TOOLS_OVERVIEW = summary
-        # 绿色打印到控制台（非静默模式）
+        # Print to the console in green (non-quiet mode)
         if os.environ.get("CRUISER_QUIET") != "1":
             try:
-                print("\x1b[32m" + f"[SECURITY] 可用工具: {summary}" + "\x1b[0m")
+                print("\x1b[32m" + f"[SECURITY] Available tools: {summary}" + "\x1b[0m")
             except Exception:
-                print(f"[SECURITY] 可用工具: {summary}")
+                print(f"[SECURITY] Available tools: {summary}")
     except Exception:
-        # 静默失败
+        # Fail silently
         pass
 
 
 # ------------------------------
-# 轻量异常判定
+# Lightweight error classification
 # ------------------------------
 def _is_context_limit_error(err: Exception) -> bool:
-    """更严格地检测上下文超限错误，避免误判。
+    """Detect context-limit errors more strictly to avoid false positives.
 
-    仅当错误文本包含以下更明确的短语时才认为是上下文超限：
+    The error is treated as a context-limit error only when its text contains one of these more explicit phrases:
     - "maximum context length"
     - "max context length"
     - "token limit"
-    - "exceeds" 且同时包含 "token" 或 "context"
-    - "exceeded" 且同时包含 "token" 或 "context"
-    - "context window" 与 "exceed"
+    - "exceeds" together with "token" or "context"
+    - "exceeded" together with "token" or "context"
+    - "context window" together with "exceed"
     """
     try:
         text = f"{getattr(err, 'message', '')} {err}"
@@ -101,9 +101,9 @@ def _is_context_limit_error(err: Exception) -> bool:
         return False
 
 # ------------------------------
-# 会话内对话历史（内存态，仅当前进程生命周期）
+# In-session conversation history (in memory, lives only as long as the current process)
 # ------------------------------
-_CONV_HISTORY: List[Dict[str, str]] = []  # 每项: {"q": str, "a": str, "r"?: str, "n"?: str}
+_CONV_HISTORY: List[Dict[str, str]] = []  # Each item: {"q": str, "a": str, "r"?: str, "n"?: str}
 
 
 def _format_conversation_context(limit: int = 10) -> str:
@@ -115,7 +115,7 @@ def _format_conversation_context(limit: int = 10) -> str:
         a = item.get("a", "")
         r = item.get("r", "")
         n = item.get("n", "")
-        # 适度截断，避免超长
+        # Truncate moderately to avoid overly long text
         q_show = (q[:400] + "…") if len(q) > 400 else q
         a_show = (a[:400] + "…") if len(a) > 400 else a
         line = f"- U: {q_show}\n  A: {a_show}"
@@ -130,16 +130,16 @@ def _format_conversation_context(limit: int = 10) -> str:
 
 
 def _is_info_duplicate(challenge_code: str, info: str) -> bool:
-    """检查关键信息是否已存在（去重）。
+    """Check whether a piece of key info already exists (deduplication).
     
-    使用智能匹配：提取关键部分进行比较，避免重复写入相似信息。
+    Uses smart matching: extracts the key parts for comparison to avoid writing similar info twice.
     
     Args:
-        challenge_code: 题目ID
-        info: 关键信息
+        challenge_code: challenge ID
+        info: key info
         
     Returns:
-        如果信息已存在返回True，否则返回False
+        True if the info already exists, otherwise False
     """
     if not challenge_code or not info:
         return True
@@ -149,7 +149,7 @@ def _is_info_duplicate(challenge_code: str, info: str) -> bool:
         if not os.path.exists(info_path):
             return False
         
-        # 读取现有信息
+        # Read the existing info
         with open(info_path, "r", encoding="utf-8") as f:
             content = f.read()
         
@@ -158,23 +158,23 @@ def _is_info_duplicate(challenge_code: str, info: str) -> bool:
         
         info_normalized = info.lower().strip()
         
-        # 方法1: 完全匹配
-        if f"关键信息: {info}" in content or f"关键信息: {info_normalized}" in content.lower():
+        # Method 1: exact match
+        if f"info: {info}" in content or f"info: {info_normalized}" in content.lower():
             return True
         
-        # 方法2: 提取关键部分进行匹配（适用于路径、API等）
-        # 提取路径、URL、口令等关键部分
-        # 提取路径
+        # Method 2: match on extracted key parts (for paths, APIs, etc.)
+        # Extract key parts such as paths, URLs and passwords
+        # Extract paths
         path_pattern = r'([/\w\-\.]+\.(php|html|txt|js|css|json|xml))'
         new_paths = set(re.findall(path_pattern, info, re.IGNORECASE))
         if new_paths:
-            # 检查现有信息中是否已包含这些路径
+            # Check whether the existing info already contains these paths
             for path_tuple in new_paths:
                 path = path_tuple[0] if isinstance(path_tuple, tuple) else path_tuple
                 if path.lower() in content.lower():
                     return True
         
-        # 提取URL
+        # Extract URLs
         url_pattern = r'(https?://[^\s]+)'
         new_urls = set(re.findall(url_pattern, info, re.IGNORECASE))
         if new_urls:
@@ -182,54 +182,54 @@ def _is_info_duplicate(challenge_code: str, info: str) -> bool:
                 if url.lower() in content.lower():
                     return True
         
-        # 方法3: 对于短信息（如口令、简单路径），检查是否已存在
+        # Method 3: for short info (e.g. passwords, simple paths), check whether it already exists
         if len(info) < 100:
-            # 提取所有已存在的关键信息行
+            # Collect all existing info lines
             lines = content.split("\n")
             existing_infos = []
             for i, line in enumerate(lines):
-                if "关键信息:" in line:
-                    existing_info = line.split("关键信息:")[-1].strip().lower()
+                if "info:" in line:
+                    existing_info = line.split("info:")[-1].strip().lower()
                     if existing_info:
                         existing_infos.append(existing_info)
             
-            # 检查新信息是否与已有信息高度相似
+            # Check whether the new info is highly similar to existing info
             for existing in existing_infos:
-                # 如果新信息是已有信息的子集或超集，认为是重复
+                # If the new info is a subset or superset of existing info, treat it as a duplicate
                 if info_normalized in existing or existing in info_normalized:
-                    # 但允许部分重叠（如不同路径），只对完全包含的情况判定为重复
+                    # But allow partial overlap (e.g. different paths); only full containment counts as a duplicate
                     if len(info_normalized) > 20 and len(existing) > 20:
-                        # 计算相似度（简单方法：共同词的比例）
+                        # Compute similarity (simple method: ratio of shared words)
                         new_words = set(info_normalized.split())
                         existing_words = set(existing.split())
                         if new_words and existing_words:
                             overlap = len(new_words & existing_words)
                             similarity = overlap / min(len(new_words), len(existing_words))
-                            if similarity > 0.8:  # 80%以上相似认为是重复
+                            if similarity > 0.8:  # Over 80% similar counts as a duplicate
                                 return True
                     else:
-                        # 短信息，直接检查包含关系
+                        # Short info: check containment directly
                         if info_normalized == existing or (len(info_normalized) < 30 and info_normalized in existing):
                             return True
         
         return False
     except Exception:
-        # 出错时保守处理，不写入
+        # On error, be conservative and do not write
         return True
 
 
 def _write_shared_info(challenge_code: str, worker_id: str, info: str) -> None:
-    """将关键信息写入共享文件（带去重检查）。
+    """Write key info to the shared file (with a deduplication check).
     
     Args:
-        challenge_code: 题目ID
-        worker_id: 会话编号
-        info: 关键信息（如默认口令、路径、API等）
+        challenge_code: challenge ID
+        worker_id: session number
+        info: key info (e.g. default passwords, paths, APIs)
     """
     if not challenge_code or not info:
         return
     
-    # 去重检查
+    # Deduplication check
     if _is_info_duplicate(challenge_code, info):
         return
     
@@ -237,25 +237,25 @@ def _write_shared_info(challenge_code: str, worker_id: str, info: str) -> None:
         out_dir = os.path.join(os.getcwd(), "reports")
         os.makedirs(out_dir, exist_ok=True)
         info_path = os.path.join(out_dir, f"info_{challenge_code}.txt")
-        # 使用追加模式，允许多个会话写入
+        # Use append mode so multiple sessions can write
         with open(info_path, "a", encoding="utf-8") as f:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"[{timestamp}] 会话: {worker_id}\n")
-            f.write(f"关键信息: {info}\n")
+            f.write(f"[{timestamp}] session: {worker_id}\n")
+            f.write(f"info: {info}\n")
             f.write("-" * 60 + "\n")
     except Exception:
         pass
 
 
 def _read_shared_info(challenge_code: str, limit: int = 5) -> str:
-    """读取共享的关键信息文件，默认只返回最后5条。
+    """Read the shared key-info file; by default return only the last 5 entries.
     
     Args:
-        challenge_code: 题目ID
-        limit: 返回的信息条数，默认5条
+        challenge_code: challenge ID
+        limit: number of entries to return, default 5
         
     Returns:
-        共享信息的文本内容，如果文件不存在或读取失败则返回空字符串
+        The text of the shared info, or an empty string if the file does not exist or cannot be read
     """
     if not challenge_code:
         return ""
@@ -266,67 +266,67 @@ def _read_shared_info(challenge_code: str, limit: int = 5) -> str:
             with open(info_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
-                    # 按分隔线分割，每条信息以 "------------------------------------------------------------" 结尾
+                    # Split on the separator line; each entry ends with "------------------------------------------------------------"
                     separator = "-" * 60
-                    # 使用分隔符分割，保留分隔符前后的内容
+                    # Split on the separator, keeping the content before and after it
                     parts = content.split(separator)
-                    # 过滤空条目，并重新组合（每条信息 + 分隔符）
+                    # Drop empty entries and recombine (each entry + separator)
                     entries = []
                     for i, part in enumerate(parts):
                         part = part.strip()
                         if part:
                             entries.append(part)
-                    # 取最后 limit 条
+                    # Take the last `limit` entries
                     if entries:
                         last_entries = entries[-limit:]
-                        # 重新组合，每条后面加上分隔线
+                        # Recombine, appending a separator line after each entry
                         result = (separator + "\n").join(last_entries)
                         if result:
-                            return f"\n共享关键信息（来自其他会话，最近{len(last_entries)}条）:\n{result}\n{separator}\n"
+                            return f"\nShared key info (from other sessions, latest {len(last_entries)} entries):\n{result}\n{separator}\n"
     except Exception:
         pass
     return ""
 
 
 def _extract_key_info(observation: str, thought: str, tool: str, llm) -> Optional[Dict[str, str]]:
-    """从观察结果中提取客观的关键信息。
+    """Extract objective key info from an observation.
     
-    关键信息包括：默认口令、新路径、新API等。
-    注意：已确定的漏洞点不算关键信息。
-    直接使用LLM判断是否是客观的关键信息。
+    Key info includes: default passwords, new paths, new APIs, etc.
+    Note: an already-identified vulnerability point does not count as key info.
+    The LLM is used directly to judge whether something is objective key info.
     
     Args:
-        observation: 工具执行的观察结果
-        thought: 当前思考
-        tool: 使用的工具
-        llm: LLM实例，用于判断是否是关键信息
+        observation: observation from the tool run
+        thought: current thought
+        tool: the tool used
+        llm: LLM instance used to judge whether it is key info
         
     Returns:
-        如果是关键信息，返回 {"info": "..."}，否则返回 None
+        {"info": "..."} if it is key info, otherwise None
     """
     if not observation or len(observation) < 10 or llm is None:
         return None
     
     try:
         verify_prompt = (
-            "请判断以下信息中是否包含客观的关键信息 只包括默认口令、新的路径、新的API\n"
-            f"思考: {thought}\n"
-            f"观察: {observation}\n"
-            f"使用的工具: {tool}\n\n"
-            "判断标准：\n"
-            "1. 必须是客观的、可验证的信息（如具体的路径、API、口令等）\n"
-            "2. 必须对解题有实际帮助\n"
-            "3. 不要提取服务器指纹、版本号等基础信息（除非是特定的漏洞版本）\n"
-            "4. 不要提取已经广泛知道的信息\n"
-            "6. 信息必须简洁明确，避免冗长描述\n\n"
-            "7. 你需要从思考和观察中综合判断信息是否正确\n"
-            "关键信息示例：默认口令、新发现的路径、新发现的API端点、配置文件位置等。\n"
-            "如果是客观的关键信息，返回JSON: {\"is_key\": true, \"info\": \"关键信息（简洁提取，不超过50字）\"}\n"
-            "如果不是关键信息，返回JSON: {\"is_key\": false}\n"
-            "只返回JSON，不要其他内容。"
+            "Determine whether the following contains objective key info; this covers only default passwords, new paths and new APIs\n"
+            f"Thought: {thought}\n"
+            f"Observation: {observation}\n"
+            f"Tool used: {tool}\n\n"
+            "Criteria:\n"
+            "1. It must be objective, verifiable info (e.g. a concrete path, API, password)\n"
+            "2. It must actually help solve the challenge\n"
+            "3. Do not extract basic info such as server fingerprints or version numbers (unless it is a specific vulnerable version)\n"
+            "4. Do not extract widely known info\n"
+            "6. The info must be concise and clear; avoid lengthy descriptions\n\n"
+            "7. Judge whether the info is correct by combining the thought and the observation\n"
+            "Examples of key info: default passwords, newly found paths, newly found API endpoints, config file locations, etc.\n"
+            "If it is objective key info, return JSON: {\"is_key\": true, \"info\": \"key info (concise, at most 50 words)\"}\n"
+            "If it is not key info, return JSON: {\"is_key\": false}\n"
+            "Return only JSON, nothing else."
         )
         verify_msgs = [
-            SystemMessage(content="你是一个信息提取助手，负责识别客观的关键信息。只识别确实存在的、可验证的关键信息，如默认口令、新发现的路径/API等。"),
+            SystemMessage(content="You are an information-extraction assistant responsible for identifying objective key info. Only identify key info that actually exists and is verifiable, such as default passwords and newly found paths/APIs."),
             HumanMessage(content=verify_prompt),
         ]
         verify_resp = llm.invoke(verify_msgs)
@@ -341,16 +341,16 @@ def _extract_key_info(observation: str, thought: str, tool: str, llm) -> Optiona
                         "info": info
                     }
     except Exception:
-        # LLM判断失败，不记录
+        # LLM judgment failed; do not record
         pass
     
     return None
 
 
 def _should_print_llm_input() -> bool:
-    """是否打印传给大模型的输入内容。
+    """Whether to print the input sent to the LLM.
 
-    默认关闭；当设置 CRUISER_PRINT_LLM_INPUT 为 "1" 或 "true" 时开启；同时若 CRUISER_QUIET=1 一律不打印。
+    Off by default; on when CRUISER_PRINT_LLM_INPUT is "1" or "true"; never printed when CRUISER_QUIET=1.
     """
     if os.environ.get("CRUISER_QUIET") == "1":
         return False
@@ -359,13 +359,13 @@ def _should_print_llm_input() -> bool:
 
 
 def _render_msgs_for_print(msgs: List[object]) -> str:
-    """将发送给 LLM 的消息渲染为可读文本。"""
+    """Render the messages sent to the LLM as readable text."""
     parts: List[str] = []
     for m in msgs:
         try:
             role = getattr(m, "type", None) or getattr(m, "role", None)
             if not role:
-                # LangChain 消息类：SystemMessage/HumanMessage/AIMessage/ToolMessage
+                # LangChain message classes: SystemMessage/HumanMessage/AIMessage/ToolMessage
                 cls_name = m.__class__.__name__.replace("Message", "").lower()
                 role = "system" if "system" in cls_name else ("human" if "human" in cls_name else ("ai" if "ai" in cls_name else ("tool" if "tool" in cls_name else cls_name)))
             content = getattr(m, "content", "")
@@ -384,7 +384,7 @@ def _render_msgs_for_print(msgs: List[object]) -> str:
 
 
 def _print_llm_input(msgs: List[object], label: str = "") -> None:
-    """打印将发送给大模型的消息内容。"""
+    """Print the messages about to be sent to the LLM."""
     if not _should_print_llm_input():
         return
     try:
@@ -402,12 +402,12 @@ def _print_llm_input(msgs: List[object], label: str = "") -> None:
 
 
 def build_system_prompt() -> str:
-    # 动态拼接工具说明，避免硬编码
+    # Build the tool descriptions dynamically to avoid hardcoding
     lines = [BASE_SYSTEM_PROMPT]
-    # 注入当前环境的命令行安全工具概览
+    # Inject an overview of the command-line security tools available in this environment
     if _SECURITY_TOOLS_OVERVIEW:
-        lines.append("\n\n当前环境可用的命令行安全工具：" + _SECURITY_TOOLS_OVERVIEW + "\n")
-    lines.append("\n可用工具 (name: description):\n")
+        lines.append("\n\nCommand-line security tools available in this environment: " + _SECURITY_TOOLS_OVERVIEW + "\n")
+    lines.append("\nAvailable tools (name: description):\n")
     for t in ALL_TOOLS:
         desc = (t.description or "").strip()
         lines.append(f"- {t.name}: {desc}")
@@ -419,9 +419,9 @@ def _tool_map() -> Dict[str, any]:
 
 
 def _tool_specs_text() -> str:
-    """为每个可用工具生成可读的参数规范与最小示例，帮助模型"感知"如何调用。"""
-    parts: List[str] = ["\n工具参数规范与示例:\n"]
-    # 预置最小示例（更贴近实际使用）
+    """Generate a readable argument spec and a minimal example for each available tool, helping the model "see" how to call it."""
+    parts: List[str] = ["\nTool argument specs and examples:\n"]
+    # Preset minimal examples (closer to real usage)
     minimal_examples = {
         "read_file": {"tool": "read_file", "args": {"path": "./README.md"}},
         "run_command": {"tool": "run_command", "args": {"command": "echo hello"}},
@@ -435,23 +435,23 @@ def _tool_specs_text() -> str:
                 js = schema.model_json_schema()
                 required = js.get("required", [])
                 properties = js.get("properties", {})
-                # 只展示精简信息：必填字段与字段描述
+                # Show only condensed info: required fields and field descriptions
                 props_lines: List[str] = []
                 for k, v in properties.items():
                     pdesc = v.get("description") or ""
                     ptype = v.get("type") or v.get("anyOf") or ""
                     props_lines.append(f"    • {k}: {pdesc} (type={ptype})")
-                parts.append(f"  必填字段: {required if required else '无'}")
+                parts.append(f"  Required fields: {required if required else 'none'}")
                 if props_lines:
-                    parts.append("  字段:")
+                    parts.append("  Fields:")
                     parts.extend(props_lines)
         except Exception:
             pass
-        # 示例
+        # Example
         try:
             example = minimal_examples.get(t.name)
             if example:
-                parts.append("  示例(JSON 一行):")
+                parts.append("  Example (one-line JSON):")
                 parts.append("  " + json.dumps(example, ensure_ascii=False))
         except Exception:
             pass
@@ -467,13 +467,13 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
     - Requires the model to set tool='none' only when it can output final JSON
       like {"flag":"flag_content"}. Premature stops are ignored and the loop continues.
     """
-    tool_names = "|".join([t.name for t in ALL_TOOLS] + ["none"])  # 动态生成可选工具名
+    tool_names = "|".join([t.name for t in ALL_TOOLS] + ["none"])  # Build the list of selectable tool names dynamically
     conv_ctx = _format_conversation_context(10)
 
-    # 读取可调超时策略（当前未在本函数内直接使用，保留在说明中）
+    # Read the tunable timeout policy (not used directly in this function at the moment; kept in the instructions)
 
     tool_names_list = [t.name for t in ALL_TOOLS]
-    tool_names_str = f"可用工具名: {tool_names_list}。"
+    tool_names_str = f"Available tool names: {tool_names_list}."
     tool_specs_text = _tool_specs_text()
     react_instruction = (
         REACT_INSTRUCTION_TEMPLATE.replace("{tool_names_placeholder}", tool_names_str, 1)
@@ -482,7 +482,7 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
     )
     instruction = (
         build_system_prompt()
-        + ("\n\n最近对话（最多 10 轮）：\n" + conv_ctx if conv_ctx else "")
+        + ("\n\nRecent conversation (up to 10 turns):\n" + conv_ctx if conv_ctx else "")
         + react_instruction
     )
 
@@ -490,21 +490,21 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
         try:
             lines = q.splitlines()
             for i in range(len(lines)):
-                if lines[i].strip().startswith("题目提示："):
-                    lines[i] = f"题目提示：{hint}"
+                if lines[i].strip().startswith("Challenge hint: "):
+                    lines[i] = f"Challenge hint: {hint}"
                     return "\n".join(lines)
-            # 否则在最前面插入
-            return f"题目提示：{hint}\n" + q
+            # Otherwise insert it at the top
+            return f"Challenge hint: {hint}\n" + q
         except Exception:
             return q
 
 
 
-    # 绑定当前题目的 challenge_code（由外部调度器下发或环境变量提供）
+    # Bind the current challenge's challenge_code (dispatched by the external scheduler or provided via an environment variable)
     current_challenge_code = os.environ.get("CRUISER_CHALLENGE_CODE") or (challenge_code or "")
 
 
-    # 外层：按任务轮次循环（每轮为一次完整的目标扫描，会在找到 flag 后根据策略决定是否切换目标/等待）
+    # Outer loop: iterate by task round (each round is one full scan of the target; after a flag is found the policy decides whether to switch targets or wait)
     worker_id = os.environ.get("CRUISER_WORKER_ID", "unknown")
     while True:
         scratchpad = ""
@@ -515,12 +515,12 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
         hint = ""
         gethint = False
         flag_confirmed = False
-        cached_shared_info = ""  # 缓存的关键信息
-        last_info_read_step = -1  # 记录上次读取关键信息的步数
+        cached_shared_info = ""  # Cached key info
+        last_info_read_step = -1  # Step at which key info was last read
         while True:
-            # 任务切换由外部调度器（main）监控并控制；会话内不再轮询任务变更
+            # Task switching is monitored and controlled by the external scheduler (main); the session no longer polls for task changes
 
-            # 若有共享提示文件（由任一会话写入），则全体会话同步看到提示（可通过环境变量 CRUISER_DISABLE_HINT 禁用）
+            # If a shared hint file exists (written by any session), all sessions see the hint (can be disabled via the CRUISER_DISABLE_HINT environment variable)
             if hint == "" and current_challenge_code and os.environ.get("CRUISER_DISABLE_HINT") != "1":
                 try:
                     out_dir = os.path.join(os.getcwd(), "reports")
@@ -538,14 +538,14 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
                 gethint = True
                 user_input = _replace_hint_line(user_input, hint)
             
-            # 在阶段开始时（step == 0）或每10轮读取一次共享关键信息
+            # Read shared key info at the start of a stage (step == 0) or every 10 rounds
             should_read_info = False
             if current_challenge_code and os.environ.get("CRUISER_DISABLE_HINT") != "1":
                 if step == 0:
-                    # 阶段开始时读取一次
+                    # Read once at the start of the stage
                     should_read_info = True
                 elif step > 0 and step % 10 == 0:
-                    # 每10轮读取一次
+                    # Read once every 10 rounds
                     should_read_info = True
             
             if should_read_info:
@@ -553,19 +553,19 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
                 last_info_read_step = step
                 if cached_shared_info:
                     try:
-                        print(f"[SharedInfo] 已加载共享关键信息（第{step}轮）", flush=True)
+                        print(f"[SharedInfo] Loaded shared key info (round {step})", flush=True)
                     except Exception:
                         pass
             
             if total_steps_for_target == 100:
                 break
             
-            # 构建用户输入，包含共享关键信息（使用缓存的）
+            # Build the user input, including shared key info (from the cache)
             user_content = f"{user_input}\n\n"
             if cached_shared_info:
                 user_content += cached_shared_info + "\n"
             user_content += f"Scratchpad so far:\n{scratchpad}\n\n"
-            user_content += "请输出 JSON。"
+            user_content += "Please output JSON."
             
             msgs = [
                 SystemMessage(content=instruction),
@@ -576,29 +576,29 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
                 ai: AIMessage = llm.invoke(msgs)  # type: ignore
             except Exception as e:  # noqa: BLE001
                 if _is_context_limit_error(e):
-                    # 达到上下文上限：开启新会话（重置 scratchpad 与计数）
+                    # Context limit reached: start a new session (reset scratchpad and counters)
                     if not quiet:
                         try:
-                            print("[Session] 上下文已达上限，开启新的会话。")
+                            print("[Session] Context limit reached, starting a new session.")
                         except Exception:
                             pass
                     scratchpad = ""
                     step = 0
-                    # 可选：重新获取 LLM 实例，规避潜在会话状态
+                    # Optional: re-create the LLM instance to avoid any lingering session state
                     try:
                         llm, _, _ = get_llm()
                     except Exception:
                         pass
                     continue
-                # 其他错误：打印并继续尝试下一轮
+                # Other errors: print and try the next round
                 if not quiet or os.environ.get("CRUISER_DEBUG") == "1":
                     try:
-                        print(f"[Error] LLM 调用失败: {e}")
+                        print(f"[Error] LLM call failed: {e}")
                     except Exception:
                         pass
                 continue
 
-            # 仅在成功调用 LLM 后，才累计步数与总计，并打印 COUNT
+            # Only after a successful LLM call do we increment the step and total counters and print COUNT
             step += 1
             total_steps_for_target += 1
             try:
@@ -608,14 +608,14 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
 
             text = ai.content if isinstance(ai.content, str) else json.dumps(ai.content)
 
-            # 提取 JSON
+            # Extract JSON
             try:
                 start = text.find("{")
                 end = text.rfind("}")
                 obj = json.loads(text[start : end + 1])
             except Exception:
-                # 无法解析，继续循环强制 JSON
-                scratchpad += "Step %d\nThought: 模型输出非 JSON，继续约束其严格输出 JSON。\n\n" % step
+                # Could not parse; keep looping to enforce JSON
+                scratchpad += "Step %d\nThought: Model output was not JSON; keep requiring strict JSON output.\n\n" % step
                 continue
 
             thought = obj.get("thought", "")
@@ -626,7 +626,7 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
             if tool == "none":
                 final = obj.get("final")
                 if isinstance(final, str) and final:
-                    # 若 final 是 JSON 并包含 flag，则捕获并按策略处理（不立即返回）
+                    # If final is JSON containing a flag, capture it and handle it per policy (do not return immediately)
                     try:
                         fs, fe = final.find("{"), final.rfind("}")
                         if fs != -1 and fe != -1:
@@ -639,46 +639,46 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
                                         print(f"\x1b[95;1m[FOUND FLAG] {flag_json}\x1b[0m", flush=True)
                                     except Exception:
                                         pass
-                                    # 成功提交并确认 flag：立即结束会话，返回结果 JSON
+                                    # Flag submitted and confirmed: end the session immediately and return the result JSON
                                     return flag_json
                                 else:
-                                    # 未经 submit_flag 成功确认，继续
-                                    scratchpad += "Action: none\nObservation: 检测到 flag 字段但尚未通过 submit_flag 成功确认，继续流程。\n\n"
+                                    # Not yet confirmed by a successful submit_flag; continue
+                                    scratchpad += "Action: none\nObservation: A flag field was detected but has not been confirmed by a successful submit_flag; continuing.\n\n"
                                     continue
                     except Exception:
                         pass
-                # 未提供有效 flag，继续
-                scratchpad += "Action: none\nObservation: 试图提前停止但未提供有效 flag，继续扫描。\n\n"
-                # 若设置了步数上限，则达到上限后保持继续（无限制），因此这里不强制终止
+                # No valid flag provided; continue
+                scratchpad += "Action: none\nObservation: Attempted to stop early without a valid flag; continuing the scan.\n\n"
+                # Even with a step limit set, we keep going after reaching it (unlimited), so do not force termination here
                 continue
 
             fn = mapping.get(tool)
             if not fn:
-                scratchpad += f"Action: INVALID_TOOL({tool})\nObservation: 未知工具\n\n"
+                scratchpad += f"Action: INVALID_TOOL({tool})\nObservation: unknown tool\n\n"
                 continue
 
-            # 执行 Action
+            # Execute the action
             try:
                 out = fn.invoke(args)
             except Exception as e:  # noqa: BLE001
-                out = f"[ERROR] 工具执行失败: {e}"
+                out = f"[ERROR] Tool execution failed: {e}"
 
 
             scratchpad += f"Action: {tool}({json.dumps(args, ensure_ascii=False)})\nObservation:\n{out}\n"
-            # submit_flag 成功确认
+            # submit_flag confirmed success
             try:
                 if tool == "submit_flag":
                     txt = str(out or "")
-                    if ("提交flag正确" in txt) or ("已经提交成功过了" in txt):
+                    if ("FLAG CORRECT" in txt) or ("ALREADY SUBMITTED" in txt):
                         flag_confirmed = True
             except Exception:
                 pass
 
-            # 反思与下一步建议
+            # Reflection and next-step suggestion
             try:
                 reflect_prompt = REFLECT_PROMPT
 
-                reflect_system = build_system_prompt() + ("\n\n最近对话（最多 10 轮）：\n" + conv_ctx if conv_ctx else "")
+                reflect_system = build_system_prompt() + ("\n\nRecent conversation (up to 10 turns):\n" + conv_ctx if conv_ctx else "")
                 msgs_reflect = [
                     SystemMessage(content=reflect_system),
                     HumanMessage(
@@ -710,10 +710,10 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
                     except Exception:
                         pass
                 
-                # 在反思阶段每6轮记录一次关键信息
+                # Record key info once every 6 rounds during the reflection phase
                 if current_challenge_code and step > 0 and step % 6 == 0:
                     try:
-                        # 基于观察结果和反思内容提取关键信息
+                        # Extract key info from the observation and the reflection
                         combined_context = f"{thought}\n{out}\n{reflection}"
                         key_info = _extract_key_info(combined_context, thought, tool, llm)
                         if key_info:
@@ -725,7 +725,7 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
                                     info_text
                                 )
                                 try:
-                                    print(f"[KeyInfo] 在反思阶段发现共享关键信息: {info_text[:50]}...", flush=True)
+                                    print(f"[KeyInfo] Found shared key info during reflection: {info_text[:50]}...", flush=True)
                                 except Exception:
                                     pass
                     except Exception:
@@ -735,10 +735,10 @@ def _react_until_flag(llm, user_input: str, flag_key: str = "flag", max_steps: i
 
             scratchpad += "\n"
 
-            # 若设置了有限步数，达到后也不终止，只是提示继续（满足“直到找到 flag”）
+            # With a finite step limit, do not stop when it is reached; just note it and continue (satisfies "until a flag is found")
             if max_steps > 0 and step >= max_steps:
-                scratchpad += f"[Info] 已达到步数上限 {max_steps}，继续循环直至找到 flag。\n\n"
-                # 重置计数但保留 scratchpad 以便继续
+                scratchpad += f"[Info] Step limit {max_steps} reached; continuing the loop until a flag is found.\n\n"
+                # Reset the counter but keep the scratchpad so we can continue
                 step = 0
 
 
@@ -749,7 +749,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
     using available tools, and to stop with a strict one-line JSON: {"flag":"..."}
     or {"flag": null} when not found.
     """
-    # 启动时刷新一次安全工具概览
+    # Refresh the security tools overview once at startup
     try:
         _refresh_security_tools_overview()
     except Exception:
@@ -765,12 +765,12 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
     worker_id = os.environ.get("CRUISER_WORKER_ID")
     worker_hint = WORKER_HINT_TEMPLATE.format(worker_id=worker_id) if worker_id else ""
     if hint:
-        hint_line = f"题目提示：{hint}\n"
+        hint_line = f"Challenge hint: {hint}\n"
     else:
-        hint_line = "题目提示：暂无\n"
-    code_line = f"题目代码：{challenge_code}\n" if challenge_code else ""
+        hint_line = "Challenge hint: none\n"
+    code_line = f"Challenge code: {challenge_code}\n" if challenge_code else ""
     ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR")
-    ws_line = f"会话工作空间目录：{ws_dir}\n" if ws_dir else ""
+    ws_line = f"Session workspace directory: {ws_dir}\n" if ws_dir else ""
     question = SCAN_QUESTION_TEMPLATE.format(
         target=target,
         worker_hint=worker_hint,
@@ -779,16 +779,16 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
         hint_line=hint_line,
     )
 
-    # 自动模式静默中间输出
+    # Silence intermediate output in auto mode
     prev_quiet = os.environ.get("CRUISER_QUIET")
     if quiet:
         os.environ["CRUISER_QUIET"] = "1"
     try:
-        # 连续扫描直到模型给出合法 JSON flag
+        # Keep scanning until the model outputs a valid JSON flag
         result_json = _react_until_flag(llm, question, flag_key="flag", max_steps=max_steps, quiet=quiet, challenge_code=challenge_code)
         return result_json
     finally:
-        # 还原环境
+        # Restore the environment
         if quiet:
             if prev_quiet is None:
                 try:

@@ -1,7 +1,7 @@
-"""调度器运行态快照：供监控面板读取。
+"""Scheduler runtime snapshot, read by the monitoring dashboard.
 
-调度主进程写入内存；dashboard 进程若独立启动则读 reports/_runtime.json，
-并始终从 reports/ 汇编黑板、任务板、flag 与题目描述。
+The scheduler main process writes it in memory; a standalone dashboard process reads reports/_runtime.json,
+and always assembles the blackboard, task board, flags and challenge descriptions from reports/.
 """
 from __future__ import annotations
 
@@ -27,20 +27,20 @@ _LOG_SEQ = 0
 _LOGS: deque[dict[str, Any]] = deque(maxlen=4000)
 
 _STAGE_LABEL = {
-    "preprocess": "预处理 · 50 步",
-    "tier1": "一级 · 100 步",
-    "tier2": "二级 · 150 步",
-    "tier3": "三级 · 200 步",
+    "preprocess": "Preprocess · 50 steps",
+    "tier1": "Tier 1 · 100 steps",
+    "tier2": "Tier 2 · 150 steps",
+    "tier3": "Tier 3 · 200 steps",
 }
 _STAGE_BY_THRESHOLD = {50: "preprocess", 100: "tier1", 150: "tier2", 200: "tier3"}
 
 _HEADER_RE = re.compile(
-    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*会话:\s*(.+)$"
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*session:\s*(.+)$"
 )
 _TASK_LINE_RE = re.compile(r"^\[(t-[0-9a-f]{6})\]\s*(.*)$")
 _LOG_PREFIX_RE = re.compile(r"^\[([^:\]]+)(?::([^\]]+))?\]\s*(.*)$")
 _INFO_NAME_RE = re.compile(r"^(?:info|desc|hint|tasks)_(.+)\.txt$")
-_FLAG_PROG_RE = re.compile(r"进度\s*(\d+)\s*/\s*(\d+)")
+_FLAG_PROG_RE = re.compile(r"progress\s*(\d+)\s*/\s*(\d+)")
 
 
 def reports_dir() -> str:
@@ -251,17 +251,17 @@ def parse_blackboard(content: str) -> list[dict[str, Any]]:
         header = lines[0] if lines else ""
         info = ""
         for line in lines:
-            if "关键信息:" in line:
-                info = line.split("关键信息:", 1)[-1].strip()
+            if "info:" in line:
+                info = line.split("info:", 1)[-1].strip()
                 break
         ts, worker = "", ""
         m = _HEADER_RE.match(header.strip())
         if m:
             ts, worker = m.group(1), m.group(2).strip()
         kind = "fact"
-        if info.startswith("[flag方法]"):
+        if info.startswith("[flag-method]"):
             kind = "flag_method"
-        elif info.startswith("[任务回报]"):
+        elif info.startswith("[task-result]"):
             kind = "task_report"
         out.append({
             "ts": ts,
@@ -461,7 +461,7 @@ def snapshot() -> dict[str, Any]:
             "container_status": meta.get("container_status") or "",
             "score": meta.get("total_score") or 0,
             "stage": stage,
-            "stage_label": _STAGE_LABEL.get(stage, "已解" if stage == "solved" else (stage or "闲置")),
+            "stage_label": _STAGE_LABEL.get(stage, "Solved" if stage == "solved" else (stage or "Idle")),
             "threshold": threshold,
             "hint_enabled": bool(st.get("hint_enabled")),
             "hint_ready": files["hint_ready"],

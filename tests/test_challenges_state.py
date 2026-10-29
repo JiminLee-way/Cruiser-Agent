@@ -41,7 +41,7 @@ def test_plaintext_and_sha256_progress(plat):
     r = plat.submit("WEB-1", "flag{wrong_guess_here}")
     assert (r.correct, r.duplicate, r.correct_count, r.total) == (False, False, 0, 2)
 
-    r = plat.submit("WEB-1", "  flag{plain_text_one}\n")  # 首尾空白不影响
+    r = plat.submit("WEB-1", "  flag{plain_text_one}\n")  # leading/trailing whitespace does not matter
     assert (r.correct, r.duplicate, r.correct_count, r.total) == (True, False, 1, 2)
     assert not {s.code: s for s in plat.list_challenges()}["WEB-1"].completed
 
@@ -49,7 +49,7 @@ def test_plaintext_and_sha256_progress(plat):
     assert (r.correct, r.duplicate, r.correct_count, r.total) == (True, False, 2, 2)
     assert {s.code: s for s in plat.list_challenges()}["WEB-1"].completed
 
-    # sha256 规格本身不是合法提交
+    # the sha256 spec itself is not a valid submission
     assert not plat.submit("WEB-1", "sha256:" + hashlib.sha256(b"flag{hashed_secret}").hexdigest()).correct
 
 
@@ -112,7 +112,7 @@ def test_cli_reset(plat, monkeypatch, capsys):
 
 
 def _submit_many(args):
-    """子进程：以随机顺序把全部 flag（夹杂错误值）各交两遍，返回首次判对的 flag 列表。"""
+    """Subprocess: submit every flag (mixed with wrong values) twice in random order; return the list of flags judged correct the first time."""
     challenges_file, state_file, seed = args
     plat = Platform(challenges_file, state_file)
     rnd = random.Random(seed)
@@ -128,12 +128,12 @@ def _submit_many(args):
 
 
 def test_concurrent_submissions_from_processes(plat):
-    plat.challenges()  # 先校验 YAML
+    plat.challenges()  # validate the YAML first
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(8) as pool:
         results = pool.map(_submit_many, [(plat.challenges_file, plat.state_file, s) for s in range(8)])
     fresh = [f for chunk in results for f in chunk]
-    # 每枚 flag 恰好被判定一次「首次正确」，没有丢失也没有重复计数
+    # each flag is judged "correct for the first time" exactly once, with nothing lost or double-counted
     assert sorted(fresh) == sorted(MULTI_FLAGS)
     assert plat.progress("MULTI-1") == (20, 20)
     state = json.load(open(plat.state_file))

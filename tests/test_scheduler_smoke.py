@@ -1,8 +1,8 @@
-"""调度器冒烟测试：stub `claude` + 静态目标题，跑完整的 main.py --sessions 2 流水线。
+"""Scheduler smoke test: stub `claude` + a static-target challenge, running the full main.py --sessions 2 pipeline.
 
-stub 按真实 claude CLI 的 stream-json 形态输出：assistant 事件里的 Bash tool_use 调用
-提示词中给出的 submit_flag.py 命令（并真的执行它），随后输出 user(tool_result) 与 result。
-验证：题目被本地平台记为解出、调度器打印退出信息并以 0 退出。
+The stub mimics the real claude CLI stream-json output: a Bash tool_use in an assistant event calls
+the submit_flag.py command given in the prompt (and really runs it), then emits user(tool_result) and result.
+Verifies: the challenge is recorded as solved by the local platform, and the scheduler prints its exit message and exits with 0.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ STUB = textwrap.dedent('''\
 
     emit({{"type": "system", "subtype": "init"}})
     emit({{"type": "assistant", "message": {{"content": [
-        {{"type": "text", "text": "找到 flag，提交"}},
+        {{"type": "text", "text": "found the flag, submitting"}},
         {{"type": "tool_use", "id": "t1", "name": "Bash", "input": {{"command": cmd}}}},
     ]}}}})
     out = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout
@@ -83,7 +83,7 @@ def test_main_sessions_2_solves_static_challenge(repo_copy, tmp_path, http_targe
         CRUISER_CONTAINER_WARMUP="10",
         STUB_FLAG=FLAG,
         DEEPSEEK_API_KEY="sk-fake-for-tests",
-        # watcher / [flag方法] 的 LLM 请求打到关闭的端口，快速失败、不出网
+        # watcher / [flag-method] LLM requests hit a closed port so they fail fast without going online
         DEEPSEEK_BASE_URL="http://127.0.0.1:9/v1",
         ANTHROPIC_BASE_URL="http://127.0.0.1:9/anthropic",
         CRUISER_LOG_FILE=str(tmp_path / "cruiser.log"),
@@ -96,12 +96,12 @@ def test_main_sessions_2_solves_static_challenge(repo_copy, tmp_path, http_targe
     out = proc.stdout + proc.stderr
     print(out)
     assert proc.returncode == 0, out[-4000:]
-    assert "[Stage-Preprocess] 启动 SMOKE-1" in out
+    assert "[Stage-Preprocess] starting SMOKE-1" in out
     assert "[SMOKE-1:S1]" in out and "[COUNT] 1" in out
-    assert "[SUBMIT_FLAG][OK] 提交正确，flag 进度 1/1" in out
-    assert "全部 flag 已齐 (1/1)" in out
-    assert "[SMOKE-1] [STAGE] 平台 flag 进度 1/1，结束本轮" in out
-    assert "全部题目已解出，退出" in out
+    assert "[SUBMIT_FLAG][OK] submission correct, flag progress 1/1" in out
+    assert "all flags collected (1/1)" in out
+    assert "[SMOKE-1] [STAGE] platform flag progress 1/1, ending this round" in out
+    assert "all challenges solved, exiting" in out
 
     state = json.loads((repo_copy / "reports" / "_platform_state.json").read_text())
     assert state["challenges"]["SMOKE-1"]["solved"] == [0]

@@ -74,7 +74,7 @@ def test_compose_up_failure_raises(yaml_path, tmp_path):
 
 def test_docker_missing_raises_start_error(yaml_path, tmp_path):
     plat = _platform(yaml_path, tmp_path, FakeRunner(exc=FileNotFoundError("docker")))
-    with pytest.raises(StartError, match="未找到 docker"):
+    with pytest.raises(StartError, match="docker command not found"):
         plat.start("Web-12")
 
 
@@ -110,7 +110,7 @@ def test_down_leftovers_without_docker(yaml_path, tmp_path, monkeypatch):
     monkeypatch.setattr(challenges.shutil, "which", lambda name: None)
     assert _platform(yaml_path, tmp_path, runner).down_leftovers() == []
     assert runner.calls == []
-    # docker 在但 compose 插件缺失：ls 失败时静默跳过
+    # docker present but the compose plugin missing: silently skipped when ls fails
     monkeypatch.setattr(challenges.shutil, "which", lambda name: "/usr/bin/docker")
     failing = FakeRunner(returncode=125, stderr="unknown command: docker compose")
     assert _platform(yaml_path, tmp_path, failing).down_leftovers() == []

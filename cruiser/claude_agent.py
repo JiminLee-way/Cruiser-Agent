@@ -1,10 +1,10 @@
-"""Claude Code 驱动的自动扫描引擎（替代手写 ReAct 循环）。
+"""Claude Code driven auto-scan engine (replaces the hand-written ReAct loop).
 
-通过 claude CLI 的 stream-json 模式运行自主 Agent：
-- 每个 assistant 事件计为一步并打印 [COUNT] n（供 main.py 调度器做步数阈值监控，语义不变）
-- 共享关键信息黑板机制不变：reports/info_<code>.txt 与 hint_<code>.txt 的
-  文件、格式、读写时机均由提示词约定，Claude Code 用自身文件工具直接读写
-- flag 必须经 tools/submit_flag.py（本地题目平台 cruiser/challenges.py）确认后，才输出最终 JSON
+Runs an autonomous agent through the claude CLI's stream-json mode:
+- every assistant event counts as one step and prints [COUNT] n (used by the main.py scheduler for step-threshold monitoring; semantics unchanged)
+- the shared key-information blackboard mechanism is unchanged: the files, format and read/write timing of reports/info_<code>.txt and hint_<code>.txt
+  are all defined by the prompts; Claude Code reads and writes them directly with its own file tools
+- a flag must be confirmed through tools/submit_flag.py (local challenge platform cruiser/challenges.py) before the final JSON is output
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Watcher 可见窗口（默认覆盖约 20～24 个回合；可用环境变量再加大）
+# Watcher visibility window (covers about 20-24 turns by default; can be enlarged via environment variables)
 _WATCHER_RECENT_MAX = max(12, _env_int("CRUISER_WATCHER_RECENT", 48))
 _WATCHER_EVERY = max(1, _env_int("CRUISER_WATCHER_EVERY", 4))
 _WATCHER_THOUGHT_CHARS = max(200, _env_int("CRUISER_WATCHER_THOUGHT_CHARS", 800))
@@ -48,12 +48,12 @@ _WATCHER_TASKS_CHARS = 3000
 _WATCHER_CLAIMED_CHARS = 2500
 _WATCHER_DESC_CHARS = 2500
 _WATCHER_HINT_CHARS = 2500
-_WATCHER_FULL_ITEMS = 12  # 活动摘要里最近这么多条保留全文，更早的压成短句以腾出历史窗口
+_WATCHER_FULL_ITEMS = 12  # this many most recent activity items keep their full text; older ones are compressed to short snippets to free up history window
 
 
-# 每个 Claude 会话的最大轮数（claude 的「回合(turn)」数，经 --max-turns 传入；注意 turn ≠ 日志 [COUNT]，
-# [COUNT] 数每个 assistant 事件、约为 turn 数的数倍）：<=0 表示不限制（不向 claude 传 --max-turns），
-# 由调度器的步数阈值 / flag 确认 / 上下文上限自然收敛。可用 CRUISER_MAX_TURNS 覆盖（默认 0 = 不限制）。
+# Maximum turns per Claude session (claude's "turn" count, passed via --max-turns; note turn != the log's [COUNT],
+# [COUNT] counts every assistant event and is several times the turn count): <=0 means unlimited (--max-turns is not passed to claude),
+# letting the scheduler's step threshold / flag confirmation / context limit bound it naturally. Override with CRUISER_MAX_TURNS (default 0 = unlimited).
 def _max_turns_per_session() -> int:
     try:
         return int(os.environ.get("CRUISER_MAX_TURNS", "0") or "0")
@@ -61,25 +61,25 @@ def _max_turns_per_session() -> int:
         return 0
 
 
-# 提交 flag 成功的外部确认标记（与 tools.submit_flag 输出保持一致）
-_FLAG_OK_MARKERS = ("提交flag正确", "已经提交成功过了")
-# 只认「调用」submit_flag.py CODE FLAG，不认路径里碰巧出现这个文件名（如 grep .../submit_flag.py）
+# External confirmation markers of a successful flag submission (kept consistent with tools.submit_flag output)
+_FLAG_OK_MARKERS = ("FLAG CORRECT", "ALREADY SUBMITTED")
+# Only accept an actual "invocation" submit_flag.py CODE FLAG, not the file name merely appearing in a path (e.g. grep .../submit_flag.py)
 _SUBMIT_INVOKE_RE = re.compile(
     r"""(?:^|[\s;|&])(?:\S*/)?submit_flag\.py\s+([A-Za-z0-9]+-\d+)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&><`]+))"""
 )
-# flag{...} 形态候选提取
-# 只抠「像真 flag 的外壳+内容」：拒绝源码里 startswith('flag{') 扫到下一个 } 的片段
+# flag{...}-shaped candidate extraction
+# Only extract "real-flag-like wrapper + content": reject snippets like startswith('flag{') in source code running to the next }
 _FLAG_PATTERN_RE = re.compile(r"[A-Za-z0-9_]{2,20}\{[A-Za-z0-9_+\-./:=]{8,300}\}")
 
 
-# 同一段文本里超过这个数量的 flag{...} 视为爆破/枚举输出，禁止自动提交。
-# 略大于 2：多 flag 题一次 cat 出 3～5 枚是常见情况，不应整段跳过。
+# More than this many flag{...} in one text blob is treated as brute-force/enumeration output and is never auto-submitted.
+# Slightly above 2: in multi-flag challenges a single cat often prints 3-5 flags, which should not be skipped wholesale.
 _AUTO_SUBMIT_MAX_PER_BLOB = 5
-_PROGRESS_RE = re.compile(r"flag 进度\s*(\d+)/(\d+)")
+_PROGRESS_RE = re.compile(r"flag progress\s*(\d+)/(\d+)")
 
 
 def _unique_flag_cands(text: str) -> list[str]:
-    """从一段文本提取去重后的合法 flag 候选，保持出现顺序。"""
+    """Extract deduplicated valid flag candidates from a text, preserving order of appearance."""
     out: list[str] = []
     seen: set[str] = set()
     for m in _FLAG_PATTERN_RE.findall(text or ""):
@@ -91,16 +91,16 @@ def _unique_flag_cands(text: str) -> list[str]:
 
 
 def _looks_like_flag(s: str) -> bool:
-    """热路径静态判定（委托 tools.looks_flaglike_static，无 IO）：
-    形态 + 占位符 + HTML/CSS/JS 黑名单。提交判定请用 tools.looks_flaglike（含前缀学习）。"""
+    """Hot-path static check (delegates to tools.looks_flaglike_static, no IO):
+    shape + placeholders + HTML/CSS/JS blacklist. For submission decisions use tools.looks_flaglike (includes prefix learning)."""
     from .tools import looks_flaglike_static
     return looks_flaglike_static(s)
 
 
 def _submit_flag_directly(code: str, flag: str):
-    """程序化提交一个 flag，返回 FlagSubmitOutcome。
+    """Submit a flag programmatically and return a FlagSubmitOutcome.
 
-    仅自动提交走这里；字符集限制也只加在这一层，不拦模型自己调 submit_flag.py。
+    Only automatic submissions go through here; the charset restriction applies only at this layer and does not block the model calling submit_flag.py itself.
     """
     from .tools import FlagSubmitOutcome, looks_flaglike, submit_flag_outcome
     if not code or not flag or not looks_flaglike(flag):
@@ -131,57 +131,48 @@ def _project_root() -> str:
 
 
 # ---------------------------------------------------------------------------
-# 黑板 watcher：每个 worker 进程内周期性由 LLM 审阅最近活动与当前黑板，
-# 发现值得共享的新信息则按既定格式追加（机制保障，不依赖 Claude 自觉）。
+# Blackboard watcher: inside each worker process an LLM periodically reviews recent activity and the current blackboard,
+# and appends new information worth sharing in the agreed format (guaranteed by the mechanism, not relying on Claude's own initiative).
 # ---------------------------------------------------------------------------
 _WATCHER_SYSTEM = (
-    "你是 CTF 解题会话的黑板观察员。你的职责：审阅某会话最近的操作摘要，维护共享黑板的质量"
-    "（提取新关键信息、修正不准确或不完整的条目、删除已被证伪的条目），"
-    "并基于当前已知信息为所有会话推荐值得探索的方向。"
-    "黑板只记录「什么可行 / 发现了什么」的正向、可复用信息；"
-    "绝不记录「什么不可行 / 尝试失败」的负向结论，以免误导其他会话过早放弃可行方向。"
-    "绝不把具体 flag 值写入黑板（存在兜底自动提交，错误 flag 会被反复提交）。"
-    "不要新增、修改或删除 [flag方法] 条目——那是首次提交成功时由提交会话单独写入的。"
-    "只输出 JSON，不要输出任何其他内容。"
+    "You are the ledger keeper and integrator for CTF solving. The shared ledger is append-only, never deleted: you cannot delete any entry, "
+    "you can only mark an entry's status (verified = confirmed / disputed = questionable / superseded = replaced by a newer entry). "
+    "Duties: extract new concrete facts and leads from one session's recent activity; mark verified based on reproduction results, mark disputed based on counter-evidence and state the reason "
+    "(the entry is kept together with the reason, for other sessions to re-check); rewrite the complete \"solving state\" digest based on the whole ledger and the task results; "
+    "recommend exploration directions that correspond to the open items in the digest. "
+    "Never write a concrete flag value into the ledger (there is a fallback auto-submission, so a wrong flag would be submitted again and again). "
+    "Do not modify or question [flag-method] entries -- they are written separately by the submitting session on its first successful submission. "
+    "Output only JSON, nothing else."
 )
 
 _WATCHER_PROMPT_TEMPLATE = (
-    "【当前共享黑板条目】\n{blackboard}\n\n"
-    "【当前待认领的探索方向】\n{tasks}\n"
-    "【正在执行中的方向（已被其他会话认领）】\n{claimed_tasks}\n\n"
-    "【该会话最近的活动摘要】\n{activity}\n\n"
-    "请维护黑板质量并推荐探索方向，规则：\n"
-    "1. add：只提取「确认有效 / 已证实存在」的正向关键信息（可用的默认口令/凭据、确实存在的路径或 API 端点、"
-    "配置文件位置、已确认成立的漏洞点、验证可行的利用或绕过方式等）；\n"
-    "   【严禁写具体 flag 值】绝不要把 flag 内容本身（flag{{...}}、FLAG{{...}}、SEKAI{{...}}、HTB{{...}} 等任何疑似 flag 串）"
-    "写入黑板——存在兜底提交机制会自动抓取黑板里的 flag 反复提交，写错的 flag 会导致无休止地重复错误提交。\n"
-    "   【不要动 [flag方法]】首次提交成功时会单独写入获取方法，你不要 add / update / remove 这类条目；\n"
-    "   普通条目不超过 80 字；一次最多 3 条；\n"
-    "   重要：不要记录负向/排除性结论或失败尝试——例如「xx payload 无效」「基础注入失败」「爆破未成功」"
-    "「该路径不存在/404」「xx 被过滤」等一切「什么不行」的内容一律不写，"
-    "因为它们可能误导其他会话过早放弃本可行的方向；只有当某个过滤/限制已连同「确认可行的绕过」一起给出时，"
-    "才作为正向信息记录（重点写可行的绕过，而非限制本身）；\n"
-    "   黑板上已存在的条目（含大小写差异、尾部斜杠等变体）不要重复；\n"
-    "2. update：若某条目被最近活动证实不准确或不完整（如口令错误、路径笔误、结论过时），"
-    "old 填该条目现有内容的关键片段，new 填修正后的完整内容；\n"
-    "3. remove：若某条目被证实完全错误、没有价值，或属于上述「什么不行」的负向/失败结论"
-    "（可能误导其他会话），填该条目内容的关键片段予以删除；"
-    "特别地：黑板中任何含具体 flag 值（flag{{...}}/FLAG{{...}}/SEKAI{{...}}/HTB{{...}} 等疑似 flag 串）的条目，"
-    "无论对错一律删除（防止兜底机制反复提交），如需保留请只留「怎么拿到的」而非 flag 值本身；\n"
-    "4. 服务器指纹、版本号等基础信息不要收录（除非是与特定漏洞相关的版本）；\n"
-    "   题目入口/服务地址不要写死具体 IP:端口（如 http://<IP>:<端口>/probe）——靶场容器每次重启 IP 会变，"
-    "且同题不同队列共用同一黑板，写死的旧 IP 会误导其他会话。记录端点时只写相对路径或逻辑名"
-    "（如「SSRF 端点 POST /probe」「入口应用为 Smart Logistics 看板」），具体地址由各会话用当前注入的 target；\n"
-    "5. suggest_tasks：基于黑板已知信息与最近活动，推荐接下来值得探索的方向"
-    "（方向级、可执行、一句话，例如「测试 /upload 的文件上传绕过」「用已发现口令尝试后台登录」）；"
-    "已在待认领或执行中列表里的方向不要重复；没有好建议就留空；一次最多 2 条；"
-    "若题目提示给出了有序步骤，只发布能映射到某一步的方向，映射不上的（尤其扫 /24、枚举 Host、爆破 operator、调 OCR 等提示未点名的支线）一律不发布；\n"
-    "6. retire_tasks：若待认领方向列表中有明显重复（语义相同仅措辞不同）、已被黑板事实覆盖"
-    "（如早已完成）或已过时无价值的方向，填其任务 id（t-xxxxxx）予以移除，保持任务板精炼；"
-    "题目提示已点名利用原语/路径时，主动下架『爆破 admin/operator、扫同段 /24、枚举 Host、调 OCR』等偏离提示的方向；\n"
-    "7. 没有任何变化时，各字段都返回空列表。\n"
-    '严格输出 JSON：{{"add": ["..."], "update": [{{"old": "...", "new": "..."}}], '
-    '"remove": ["..."], "suggest_tasks": ["..."], "retire_tasks": ["t-xxxxxx"]}}'
+    "[Ledger entries (id status author content)]\n{blackboard}\n\n"
+    "[Directed task results]\n{results}\n\n"
+    "[Exploration directions currently waiting to be claimed]\n{tasks}\n"
+    "[Directions in progress (already claimed by other sessions)]\n{claimed_tasks}\n\n"
+    "[Current solving-state digest]\n{digest}\n\n"
+    "[This session's recent activity summary]\n{activity}\n\n"
+    "Rules:\n"
+    "1. add: new, reusable concrete facts or leads (addresses, constants, parameters, files, candidate values, verified methods, artifact file paths, etc.); "
+    "write ones that have a concrete value but are not yet confirmed as \"lead: ...\"; at most 120 characters each, at most 3 per call; do not repeat what the ledger already has; "
+    "do not record basic information such as server fingerprints or version numbers (unless tied to a specific vulnerability); do not hard-code concrete IP:port (it changes when the container restarts), write endpoints only as relative paths or logical names; "
+    "[Never write concrete flag values] never write flag{{...}}, FLAG{{...}} or any other flag-like string;\n"
+    "2. verify: ids of entries reproduced or confirmed by replay in the recent activity;\n"
+    "3. dispute: entries refuted by the recent activity or considered not applicable [{{\"id\": \"f-...\", \"reason\": \"...\"}}]; "
+    "entries are never deleted -- concrete values in a disputed entry may still be key leads, so state the basis of the reason clearly;\n"
+    "4. supersede: entries whose content needs correcting or completing [{{\"id\": \"f-...\", \"new\": \"the complete corrected content\"}}];\n"
+    "5. digest: rewrite the complete digest (not a delta) based on all ledger entries and task results, with fixed sections: "
+    "goal and success criteria / verified conclusions / open leads (list every concrete-value lead and open question not yet conclusively refuted, including disputed entries)"
+    " / key artifacts (file paths) / next integration actions (which known conclusions combined can advance to the flag); at most 2000 characters; "
+    "return an empty string when there is no substantive change from the current digest;\n"
+    "6. suggest_tasks: [{{\"text\": \"a one-sentence actionable direction\", \"basis\": \"the corresponding open lead or entry id\"}}]; "
+    "do not publish directions unrelated to the open items in the digest; if the challenge hint gives ordered steps, a direction must map to one of those steps; "
+    "do not repeat ones already pending or in progress; at most 2 per call;\n"
+    "7. retire_tasks: ids (t-xxxxxx) of pending directions that are duplicates, already done, or unrelated to the open items;\n"
+    "8. return empty for fields with no change.\n"
+    'Output strictly JSON: {{"add": [], "verify": [], "dispute": [{{"id": "", "reason": ""}}], '
+    '"supersede": [{{"id": "", "new": ""}}], "digest": "", '
+    '"suggest_tasks": [{{"text": "", "basis": ""}}], "retire_tasks": []}}'
 )
 
 _WATCHER_LLM = None
@@ -189,75 +180,32 @@ _WATCHER_LLM_LOCK = threading.Lock()
 
 
 def _get_watcher_llm():
-    """watcher 专用 LLM 单例（使用 DeepSeek deepseek-v4-pro，可经 WATCHER_MODEL 覆盖）。"""
+    """Watcher-only LLM singleton (uses DeepSeek deepseek-v4-pro; can be overridden via WATCHER_MODEL)."""
     global _WATCHER_LLM
     if _WATCHER_LLM is None:
         with _WATCHER_LLM_LOCK:
             if _WATCHER_LLM is None:
-                llm, provider, _ = get_watcher_llm()
+                from . import engines
+                eng = engines.current()
+                if eng is not None:
+                    llm, provider = eng.WatcherLLM(), f"{eng.NAME}:{eng.watcher_model()}"
+                else:
+                    llm, provider, _ = get_watcher_llm()
                 _WATCHER_LLM = llm
                 try:
-                    print(f"[Watcher] 后端模型: {provider}", flush=True)
+                    print(f"[Watcher] backend model: {provider}", flush=True)
                 except Exception:
                     pass
     return _WATCHER_LLM
 
 
-def _parse_blackboard(content: str) -> list[dict]:
-    """解析黑板文件为条目列表：[{"header": 头部行, "info": 关键信息文本}]。"""
-    sep = "-" * 60
-    entries: list[dict] = []
-    for part in content.split(sep):
-        part = part.strip()
-        if not part:
-            continue
-        lines = part.splitlines()
-        header = lines[0] if lines else ""
-        info = ""
-        for line in lines:
-            if "关键信息:" in line:
-                info = line.split("关键信息:", 1)[-1].strip()
-                break
-        entries.append({"header": header, "info": info})
-    return entries
-
-
-def _normalize_info(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").lower().strip()).rstrip("/")
-
-
-def _find_best_match(entries: list[dict], target: str) -> Optional[int]:
-    """在条目里找与 target 内容最匹配的索引（包含关系或词面相似度 >= 0.6），找不到返回 None。"""
-    t = _normalize_info(target)
-    if not t:
-        return None
-    best_idx: Optional[int] = None
-    best_score = 0.0
-    for i, e in enumerate(entries):
-        s = _normalize_info(e.get("info", ""))
-        if not s:
-            continue
-        if t == s:
-            return i
-        if t in s or s in t:
-            score = 0.85
-        else:
-            tw, sw = set(t.split()), set(s.split())
-            if not tw or not sw:
-                continue
-            score = len(tw & sw) / min(len(tw), len(sw))
-        if score > best_score:
-            best_idx, best_score = i, score
-    return best_idx if best_score >= 0.6 else None
-
-
 def _strip_flag_literals(text: str) -> str:
-    """去掉具体 flag 串，避免写入黑板后被兜底提交反复打平台。"""
+    """Strip concrete flag strings so that, once written to the blackboard, they are not repeatedly sent to the platform by the fallback submission."""
     return _FLAG_PATTERN_RE.sub("<flag>", text or "")
 
 
 def _format_watcher_activity(recent: deque[str] | list[str], budget: int = _WATCHER_ACTIVITY_CHARS) -> str:
-    """拼 watcher 活动窗口：最近若干条全文，更早的压短（头尾各留一段），整体不超过 budget。"""
+    """Build the watcher activity window: the most recent items in full, older ones shortened (keeping a head and tail), all within budget."""
     items = [x for x in recent if x]
     if not items:
         return ""
@@ -278,13 +226,13 @@ def _format_watcher_activity(recent: deque[str] | list[str], budget: int = _WATC
 
 
 def _is_flag_method(info: str) -> bool:
-    return (info or "").lstrip().startswith("[flag方法]")
+    return (info or "").lstrip().startswith("[flag-method]")
 
 
 def _flag_method_key(info: str) -> str:
-    """同一枚 flag 的方法条目键（'1'、'2'…）。识别不了则空串。"""
+    """Key of the method entry for one flag ('1', '2', ...). Empty string if it cannot be determined."""
     text = info or ""
-    m = re.search(r"进度\s*(\d+)\s*/\s*\d+", text)
+    m = re.search(r"progress\s*(\d+)\s*/\s*\d+", text)
     if m:
         return m.group(1)
     m = re.search(r"(?:flag|FLAG)\s*(\d+)", text)
@@ -298,89 +246,41 @@ def _flag_method_key(info: str) -> str:
 
 def _flag_method_dbg(msg: str) -> None:
     try:
-        print(f"\x1b[96;1m[flag方法DEBUG]\x1b[0m {msg}", flush=True)
+        print(f"\x1b[96;1m[flag-method DEBUG]\x1b[0m {msg}", flush=True)
     except Exception:
         pass
 
 
-def _write_blackboard_entries(info_path: str, entries: list[dict]) -> None:
-    sep = "-" * 60
-    tmp_path = info_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(f"{e['header']}\n")
-            f.write(f"关键信息: {e['info']}\n")
-            f.write(sep + "\n")
-    os.replace(tmp_path, info_path)
-
-
 def _append_blackboard_info(code: str, worker_id: str, info: str) -> bool:
-    """向共享黑板追加一条（文件锁 + 模糊去重）。成功写入返回 True。"""
+    """Append an entry to the shared ledger ([flag-method] is written only once per progress key). Returns True if written."""
+    from . import ledger
     info = (info or "").strip()
     if not code or not info:
-        _flag_method_dbg(f"append 拒绝: code={code!r} info_empty={not info} worker={worker_id}")
+        _flag_method_dbg(f"append rejected: code={code!r} info_empty={not info} worker={worker_id}")
         return False
-    import fcntl
-
-    reports_dir = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_dir, exist_ok=True)
-    info_path = os.path.join(reports_dir, f"info_{code}.txt")
-    lock_path = info_path + ".lock"
-    _flag_method_dbg(
-        f"append 开始 worker={worker_id} cwd={os.getcwd()!r} path={info_path} "
-        f"uid={os.geteuid()} writable_dir={os.access(reports_dir, os.W_OK)} "
-        f"info_len={len(info)} preview={info[:120]!r}"
-    )
     try:
-        with open(lock_path, "w", encoding="utf-8") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                try:
-                    with open(info_path, "r", encoding="utf-8") as f:
-                        current = f.read()
-                except FileNotFoundError:
-                    current = ""
-                except Exception as e:
-                    _flag_method_dbg(f"append 读黑板失败 path={info_path} err={type(e).__name__}: {e}")
-                    current = ""
-                entries = _parse_blackboard(current)
-                matched = _find_best_match(entries, info)
-                if matched is not None:
-                    old = (entries[matched].get("info") or "")[:120]
-                    _flag_method_dbg(f"append 跳过: 模糊匹配已有条目 idx={matched} old={old!r}")
-                    return False
-                if _is_flag_method(info):
-                    key = _flag_method_key(info)
-                    if key and any(
-                        _is_flag_method(e.get("info") or "")
-                        and _flag_method_key(e.get("info") or "") == key
-                        for e in entries
-                    ):
-                        _flag_method_dbg(f"append 跳过: 同进度键已有 [flag方法] key={key}")
-                        return False
-                entries.append({
-                    "header": f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 会话: {worker_id}",
-                    "info": info,
-                })
-                _write_blackboard_entries(info_path, entries)
-                _flag_method_dbg(f"append 成功 path={info_path} bytes={os.path.getsize(info_path)}")
-                return True
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+        kind = "flag_method" if _is_flag_method(info) else "fact"
+        if kind == "flag_method":
+            key = _flag_method_key(info)
+            if key and any(
+                f["kind"] == "flag_method" and _flag_method_key(f["text"]) == key for f in ledger.facts(code)
+            ):
+                _flag_method_dbg(f"append skipped: a [flag-method] already exists for progress key={key}")
+                return False
+        fid = ledger.add_fact(code, worker_id, info, kind=kind)
+        _flag_method_dbg(f"append result id={fid} worker={worker_id} kind={kind}")
+        return fid is not None
     except Exception as e:
-        _flag_method_dbg(
-            f"append 异常 path={info_path} err={type(e).__name__}: {e} "
-            f"cwd={os.getcwd()!r} euid={os.geteuid()}"
-        )
+        _flag_method_dbg(f"append error err={type(e).__name__}: {e}")
         return False
 
 
 _FLAG_METHOD_WRITER_PROMPT = (
-    "根据下面会话刚拿到 flag 时的活动摘要，写一条可让其他会话复现的获取方法。\n"
-    "进度：{prog}\n"
-    "只输出一行，不要 markdown，不要具体 flag 值：\n"
-    "[flag方法] 进度 {prog}。漏洞点 + 请求/路径/命令 + 关键步骤（不超过 200 字）\n\n"
-    "活动摘要：\n{activity}\n"
+    "Based on the activity summary below, from when the session just obtained the flag, write a method for obtaining it that other sessions can reproduce.\n"
+    "Progress: {prog}\n"
+    "Output only one line, no markdown, no concrete flag value:\n"
+    "[flag-method] progress {prog}. vulnerable point + request/path/command + key steps (at most 200 characters)\n\n"
+    "Activity summary:\n{activity}\n"
 )
 
 _FLAG_METHOD_SPAWNED: "set[str]" = set()
@@ -388,11 +288,11 @@ _FLAG_METHOD_SPAWNED_LOCK = threading.Lock()
 
 
 def _compose_flag_method(prog: str, activity: str) -> str:
-    """一次性把活动摘要收成一条完整 [flag方法]；LLM 不可用时退回压缩摘要。"""
+    """Condense the activity summary into one complete [flag-method] entry in a single call; falls back to a compressed summary when the LLM is unavailable."""
     activity = _strip_flag_literals(activity or "")
     llm = _get_watcher_llm()
     _flag_method_dbg(
-        f"compose 开始 prog={prog} llm={'yes' if llm is not None else 'None'} "
+        f"compose start prog={prog} llm={'yes' if llm is not None else 'None'} "
         f"activity_len={len(activity)}"
     )
     if llm is not None and activity.strip():
@@ -402,16 +302,16 @@ def _compose_flag_method(prog: str, activity: str) -> str:
                 .replace("{prog}", prog)
                 .replace("{activity}", activity[-_WATCHER_ACTIVITY_CHARS:])
             )
-            _flag_method_dbg(f"compose 调用 LLM prompt_len={len(prompt)}")
+            _flag_method_dbg(f"compose calling LLM prompt_len={len(prompt)}")
             resp = llm.invoke([
-                SystemMessage(content="只输出一行 [flag方法]，不要 flag 值，不要其他内容。"),
+                SystemMessage(content="Output only one [flag-method] line, no flag value, nothing else."),
                 HumanMessage(content=prompt),
             ])
             text = resp.content if isinstance(resp.content, str) else ""
-            _flag_method_dbg(f"compose LLM 返回 type={type(resp.content).__name__} len={len(text or '')} head={(text or '')[:160]!r}")
+            _flag_method_dbg(f"compose LLM returned type={type(resp.content).__name__} len={len(text or '')} head={(text or '')[:160]!r}")
             line = ""
             for raw in (text or "").splitlines():
-                if "[flag方法]" in raw:
+                if "[flag-method]" in raw:
                     line = raw.strip()
                     break
             if not line and (text or "").strip():
@@ -419,53 +319,53 @@ def _compose_flag_method(prog: str, activity: str) -> str:
             line = _strip_flag_literals(line)
             if line:
                 if not _is_flag_method(line):
-                    line = f"[flag方法] 进度 {prog}。{line}"
-                _flag_method_dbg(f"compose LLM 成稿 len={len(line[:400])}")
+                    line = f"[flag-method] progress {prog}. {line}"
+                _flag_method_dbg(f"compose LLM draft len={len(line[:400])}")
                 return line[:400]
-            _flag_method_dbg("compose LLM 输出无法解析，改走摘要回退")
+            _flag_method_dbg("compose LLM output unparseable, falling back to the summary")
         except Exception as e:
-            _flag_method_dbg(f"compose LLM 异常 {type(e).__name__}: {e}")
+            _flag_method_dbg(f"compose LLM error {type(e).__name__}: {e}")
     snippet = re.sub(r"\s+", " ", activity).strip()[:800]
     if not snippet:
-        _flag_method_dbg("compose 失败: 活动摘要为空且无 LLM 成稿")
+        _flag_method_dbg("compose failed: activity summary is empty and there is no LLM draft")
         return ""
-    _flag_method_dbg(f"compose 回退摘要 len={len(snippet)}")
-    return f"[flag方法] 进度 {prog}。{snippet}"
+    _flag_method_dbg(f"compose fallback summary len={len(snippet)}")
+    return f"[flag-method] progress {prog}. {snippet}"
 
 
 def _write_flag_method_once(code: str, worker_id: str, prog: str, activity: str) -> None:
-    """分叉任务：写完一条 [flag方法] 即退出。"""
-    _flag_method_dbg(f"writer 线程启动 worker={worker_id} prog={prog} activity_len={len(activity or '')} ident={threading.current_thread().name}")
+    """Forked task: exits after writing one [flag-method] entry."""
+    _flag_method_dbg(f"writer thread started worker={worker_id} prog={prog} activity_len={len(activity or '')} ident={threading.current_thread().name}")
     try:
         info = _compose_flag_method(prog, activity)
         if not info:
-            _flag_method_dbg(f"writer 退出: compose 空稿 worker={worker_id} prog={prog}")
+            _flag_method_dbg(f"writer exit: compose produced an empty draft worker={worker_id} prog={prog}")
             return
         ok = _append_blackboard_info(code, worker_id, info)
-        _flag_method_dbg(f"writer append 结果 ok={ok} worker={worker_id} prog={prog}")
+        _flag_method_dbg(f"writer append result ok={ok} worker={worker_id} prog={prog}")
         if ok:
-            print(f"[flag方法] 会话 {worker_id} 已写入（进度 {prog}）", flush=True)
+            print(f"[flag-method] session {worker_id} written (progress {prog})", flush=True)
     except Exception as e:
-        _flag_method_dbg(f"writer 异常 worker={worker_id} prog={prog} {type(e).__name__}: {e}")
+        _flag_method_dbg(f"writer error worker={worker_id} prog={prog} {type(e).__name__}: {e}")
 
 
 def _spawn_flag_method_writer(
     code: str, worker_id: str, correct: int, total: int, recent_items: list[str]
 ) -> Optional[threading.Thread]:
-    """首次提交成功：快照活动后丢到一次性线程，写完即弃。重复提交不会进来。"""
+    """First successful submission: snapshot the activity and hand it to a one-shot thread that is discarded once done. Duplicate submissions never get here."""
     if not code:
-        _flag_method_dbg(f"spawn 拒绝: 无 challenge code worker={worker_id}")
+        _flag_method_dbg(f"spawn rejected: no challenge code worker={worker_id}")
         return None
     prog = f"{correct}/{total}" if int(total or 0) >= 1 else (str(correct) if int(correct or 0) >= 1 else "?")
     key = f"{code}|{int(correct or 0)}|{int(total or 0)}"
     with _FLAG_METHOD_SPAWNED_LOCK:
         if key in _FLAG_METHOD_SPAWNED:
-            _flag_method_dbg(f"spawn 跳过: 本进程已分叉过 key={key} worker={worker_id}")
+            _flag_method_dbg(f"spawn skipped: this process already forked key={key} worker={worker_id}")
             return None
         _FLAG_METHOD_SPAWNED.add(key)
     activity = _format_watcher_activity(recent_items)
     _flag_method_dbg(
-        f"spawn 启动线程 worker={worker_id} key={key} prog={prog} "
+        f"spawn starting thread worker={worker_id} key={key} prog={prog} "
         f"recent_n={len(recent_items)} activity_len={len(activity)}"
     )
     t = threading.Thread(
@@ -475,27 +375,27 @@ def _spawn_flag_method_writer(
         name=f"flag-method-{worker_id}-{prog}",
     )
     t.start()
-    _flag_method_dbg(f"spawn 线程已 start alive={t.is_alive()} name={t.name}")
+    _flag_method_dbg(f"spawn thread started alive={t.is_alive()} name={t.name}")
     return t
 
 
-# 进程级已尝试提交的 flag 去重（避免 watcher 每次触发都重复提交同一 flag）
+# Process-wide dedup of flags already attempted (prevents the watcher from resubmitting the same flag every time it fires)
 _ATTEMPTED_FLAGS: "set[str]" = set()
 _ATTEMPTED_FLAGS_LOCK = threading.Lock()
 
 
 def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optional[str]:
-    """watcher 兜底提交：从给定文本中提取 flag{...} 候选，进程内去重后程序化提交。
+    """Watcher fallback submission: extract flag{...} candidates from the given texts, dedupe within the process, and submit them programmatically.
 
-    会交完本批所有候选（不因第一枚正确就返回），仅当平台进度已齐才打印最终 JSON。
-    可用 CRUISER_WATCHER_SUBMIT=0 关闭。
+    Submits every candidate in the batch (does not return just because the first one is correct); prints the final JSON only when platform progress is complete.
+    Can be disabled with CRUISER_WATCHER_SUBMIT=0.
     """
     if os.environ.get("CRUISER_WATCHER_SUBMIT", "1") != "1" or not code:
         return None
     cands: "set[str]" = set()
     for t in texts:
         blob = _unique_flag_cands(t)
-        # 一段里出现一堆 flag 是爆破输出，不自动交
+        # a pile of flags in one blob is brute-force output; do not auto-submit
         if len(blob) > _AUTO_SUBMIT_MAX_PER_BLOB:
             continue
         cands.update(blob)
@@ -515,7 +415,7 @@ def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optiona
         try:
             prog = f"{outcome.correct}/{outcome.total}" if outcome.total >= 1 else "?"
             print(
-                f"\x1b[95;1m[WATCHER SUBMIT] 会话 {worker_id} 补交成功 ({prog}): {cand}\x1b[0m",
+                f"\x1b[95;1m[WATCHER SUBMIT] session {worker_id} fallback submission accepted ({prog}): {cand}\x1b[0m",
                 flush=True,
             )
         except Exception:
@@ -530,199 +430,171 @@ def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optiona
     return last_js
 
 
-def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None:
-    """LLM 审阅最近活动与当前黑板，维护黑板质量：新增/修正/删除条目。
+def _format_ledger_for_watcher(code: str) -> tuple[str, str]:
+    """Watcher view of ledger entries and task results: (entries text, results text), keeping the newest part when over budget."""
+    from . import ledger
+    status_tag = {"verified": "verified", "disputed": "disputed", "open": "open"}
+    rows = []
+    for f in ledger.facts(code):
+        note = f" ({'; '.join(f['notes'])})" if f["notes"] else ""
+        rows.append(f"- {f['id']} [{status_tag.get(f['status'], f['status'])}] ({f['author']}) {f['text']}{note}")
+    res = [f"- {r.get('id')} ({r.get('author')}) direction '{r.get('task', '')[:80]}' -> {r.get('text', '')[:400]}"
+           for r in ledger.results(code, limit=12)]
+    facts_text = "\n".join(rows) or "(empty)"
+    return facts_text[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
 
-    并发安全：LLM 审阅基于无锁快照；应用变更时持文件锁重读最新内容，
-    按内容模糊匹配定位条目（不用行号，避免并发漂移），临时文件 + os.replace 原子重写。
-    附带：从最近活动 + 黑板里提取 flag 候选并程序化兜底提交（watcher 也能交 flag）。
+
+def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None:
+    """LLM reviews recent activity and the ledger: appends entries, marks statuses, rewrites the solving-state digest, publishes directions.
+
+    The ledger is append-only (cruiser.ledger): entries are referenced by id, disputes/supersessions are recorded as statuses keeping the original text, with no fuzzy matching or deletion.
+    Also: extracts flag candidates from recent activity + the blackboard view and submits them programmatically as a fallback (the watcher can submit flags too).
     """
     if not code or not activity.strip():
         return
     try:
+        from . import ledger
         reports_dir = os.path.join(os.getcwd(), "reports")
-        info_path = os.path.join(reports_dir, f"info_{code}.txt")
-        lock_path = info_path + ".lock"
         try:
-            with open(info_path, "r", encoding="utf-8") as f:
+            with open(os.path.join(reports_dir, f"info_{code}.txt"), "r", encoding="utf-8") as f:
                 blackboard = f.read()
         except Exception:
             blackboard = ""
-        # watcher 兜底提交：先于策展执行，即便无可用 watcher LLM 也能补交
+        # watcher fallback submission: runs before curation, so it can submit even without a usable watcher LLM
         _watcher_try_submit_flags(code, worker_id, activity, blackboard)
         llm = _get_watcher_llm()
         if llm is None:
             return
-        entries_snapshot = _parse_blackboard(blackboard)
-        numbered = "\n".join(f"- {e['info']}" for e in entries_snapshot if e["info"]) or "（空）"
+        facts_text, results_text = _format_ledger_for_watcher(code)
         from .taskboard import list_claimed, list_tasks, publish_task, retire_task
         pending_tasks = list_tasks(code)
         claimed_tasks = list_claimed(code)
-        tasks_text = "\n".join(f"- [{t['id']}] {t['text']}" for t in pending_tasks) or "（空）"
-        claimed_text = "\n".join(f"- {c['text']}（会话 {c['worker']} 执行中）" for c in claimed_tasks) or "（空）"
+        tasks_text = "\n".join(f"- [{t['id']}] {t['text']}" for t in pending_tasks) or "(empty)"
+        claimed_text = "\n".join(f"- {c['text']} (in progress by session {c['worker']})" for c in claimed_tasks) or "(empty)"
         prompt = (
             _WATCHER_PROMPT_TEMPLATE
+            .replace("{{", "{").replace("}}", "}")
             .replace("{activity}", activity[-_WATCHER_ACTIVITY_CHARS:])
-            .replace("{blackboard}", numbered[-_WATCHER_BB_CHARS:])
+            .replace("{blackboard}", facts_text)
+            .replace("{results}", results_text)
+            .replace("{digest}", ledger.digest(code) or "(none yet)")
             .replace("{tasks}", tasks_text[-_WATCHER_TASKS_CHARS:])
             .replace("{claimed_tasks}", claimed_text[-_WATCHER_CLAIMED_CHARS:])
         )
-        # 题目描述 + 提示（若已获取）：让 watcher 结合它们策展黑板、发布更贴合的探索方向
+        # challenge description + hint (if fetched): lets the watcher use them to maintain the ledger and publish better-fitting exploration directions
         context_header = ""
-        try:
-            with open(os.path.join(reports_dir, f"desc_{code}.txt"), "r", encoding="utf-8") as f:
-                _desc = f.read().strip()
-            if _desc:
-                context_header += f"【题目描述】\n{_desc[:_WATCHER_DESC_CHARS]}\n\n"
-        except Exception:
-            pass
-        try:
-            with open(os.path.join(reports_dir, f"hint_{code}.txt"), "r", encoding="utf-8") as f:
-                _hint = f.read().strip()
-            if _hint:
-                context_header += f"【题目提示】\n{_hint[:_WATCHER_HINT_CHARS]}\n\n"
-        except Exception:
-            pass
-        if context_header:
-            prompt = context_header + prompt
+        for name, label, limit in (("desc", "Challenge description", _WATCHER_DESC_CHARS), ("hint", "Challenge hint", _WATCHER_HINT_CHARS)):
+            try:
+                with open(os.path.join(reports_dir, f"{name}_{code}.txt"), "r", encoding="utf-8") as f:
+                    body = f.read().strip()
+                if body:
+                    context_header += f"[{label}]\n{body[:limit]}\n\n"
+            except Exception:
+                pass
         resp = llm.invoke([
             SystemMessage(content=_WATCHER_SYSTEM),
-            HumanMessage(content=prompt),
+            HumanMessage(content=context_header + prompt),
         ])
         text = resp.content if isinstance(resp.content, str) else json.dumps(resp.content, ensure_ascii=False)
         s, e = text.find("{"), text.rfind("}")
         if s == -1 or e == -1:
             return
         obj = json.loads(text[s: e + 1])
-        adds = [str(x).strip() for x in (obj.get("add") or []) if str(x).strip()][:3]
-        updates = [u for u in (obj.get("update") or []) if isinstance(u, dict) and u.get("old") and u.get("new")][:3]
-        removes = [str(x).strip() for x in (obj.get("remove") or []) if str(x).strip()][:3]
-        suggests = [str(x).strip() for x in (obj.get("suggest_tasks") or []) if str(x).strip()][:2]
-        retires = [str(x).strip() for x in (obj.get("retire_tasks") or []) if str(x).strip()][:3]
-        # 发布探索方向到任务板（内部含去重与板上限）
-        published = 0
-        for s_text in suggests:
+
+        def _items(key: str, n: int) -> list:
+            v = obj.get(key) or []
+            return v[:n] if isinstance(v, list) else []
+
+        known = {f["id"]: f for f in ledger.facts(code, include_superseded=True)}
+        editable = {i for i, f in known.items() if f["kind"] != "flag_method"}
+        n_add = n_ver = n_dis = n_sup = 0
+        for info in _items("add", 3):
+            info = str(info).strip()
+            if _FLAG_PATTERN_RE.search(info):
+                continue  # an entry that is a flag-like literal carries no reusable fact
+            if info and not _is_flag_method(info) and ledger.add_fact(code, worker_id, info):
+                n_add += 1
+        for fid in _items("verify", 5):
+            if str(fid) in editable and ledger.set_status(code, str(fid), "verified", by=worker_id):
+                n_ver += 1
+        for d in _items("dispute", 3):
+            if isinstance(d, dict) and str(d.get("id")) in editable and str(d.get("reason") or "").strip():
+                if ledger.set_status(code, str(d["id"]), "disputed", _strip_flag_literals(str(d["reason"])), worker_id):
+                    n_dis += 1
+        for u in _items("supersede", 3):
+            if isinstance(u, dict) and str(u.get("id")) in editable and str(u.get("new") or "").strip():
+                if ledger.supersede(code, str(u["id"]), _strip_flag_literals(str(u["new"])), worker_id):
+                    n_sup += 1
+        new_digest = _strip_flag_literals(str(obj.get("digest") or "").strip())
+        if new_digest:
+            ledger.set_digest(code, worker_id, new_digest)
+
+        published = retired = 0
+        for t in _items("suggest_tasks", 2):
+            t_text = str(t.get("text") if isinstance(t, dict) else t).strip()
+            basis = str(t.get("basis") or "").strip() if isinstance(t, dict) else ""
+            if not t_text:
+                continue
             try:
-                if publish_task(code, s_text):
+                if publish_task(code, f"{t_text} (basis: {basis})" if basis else t_text):
                     published += 1
             except Exception:
                 pass
-        # 策展任务板：下架重复/过时的方向（可按任务 id 精确移除）
-        retired = 0
-        for r in retires:
+        for r in _items("retire_tasks", 3):
             try:
-                if retire_task(code, r):
+                if retire_task(code, str(r).strip()):
                     retired += 1
             except Exception:
                 pass
-        if published or retired:
-            try:
-                print(f"[Watcher] 会话 {worker_id} 任务板: 发布 {published} / 下架 {retired}", flush=True)
-            except Exception:
-                pass
-        if not adds and not updates and not removes:
-            return
-
-        # 锁内重读最新内容并应用变更
-        import fcntl
-
-        os.makedirs(reports_dir, exist_ok=True)
-        with open(lock_path, "w", encoding="utf-8") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                try:
-                    with open(info_path, "r", encoding="utf-8") as f:
-                        current = f.read()
-                except Exception:
-                    current = ""
-                entries = _parse_blackboard(current)
-                changed = False
-
-                # 删除：按内容模糊匹配；[flag方法] 除非漏了具体 flag 值，否则不删
-                for target in removes:
-                    idx = _find_best_match(entries, target)
-                    if idx is None:
-                        continue
-                    cur = entries[idx].get("info") or ""
-                    if _is_flag_method(cur) and not _FLAG_PATTERN_RE.search(cur):
-                        continue
-                    entries.pop(idx)
-                    changed = True
-
-                # 修正：保留原头部（时间戳/会话归属），替换信息内容；不改 [flag方法]
-                for u in updates:
-                    if _is_flag_method(str(u.get("new") or "")):
-                        continue
-                    idx = _find_best_match(entries, str(u["old"]))
-                    if idx is None:
-                        continue
-                    if _is_flag_method(entries[idx].get("info") or ""):
-                        continue
-                    entries[idx]["info"] = str(u["new"]).strip()
-                    changed = True
-
-                # 新增：程序化去重后追加；[flag方法] 由首次提交分叉写入，watcher 不 add
-                for info in adds:
-                    if _is_flag_method(info):
-                        continue
-                    if _find_best_match(entries, info) is not None:
-                        continue
-                    entries.append({
-                        "header": f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 会话: {worker_id}",
-                        "info": info,
-                    })
-                    changed = True
-
-                if not changed:
-                    return
-                _write_blackboard_entries(info_path, entries)
-                try:
-                    print(f"[Watcher] 会话 {worker_id} 维护黑板: 新增 {len(adds)} / 修正 {len(updates)} / 删除 {len(removes)}", flush=True)
-                except Exception:
-                    pass
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+        try:
+            if published or retired:
+                print(f"[Watcher] session {worker_id} task board: published {published} / retired {retired}", flush=True)
+            if n_add or n_ver or n_dis or n_sup or new_digest:
+                print(f"[Watcher] session {worker_id} ledger: added {n_add} / verified {n_ver} / disputed {n_dis} / superseded {n_sup}"
+                      f"{' / digest updated' if new_digest else ''}", flush=True)
+        except Exception:
+            pass
     except Exception:
-        # watcher 失败不影响主流程
+        # a watcher failure does not affect the main flow
         pass
 
 
 def _claude_env() -> dict:
-    """构造 claude 子进程环境。
+    """Build the environment for the claude subprocess.
 
-    LLM 提供方配置（端点/密钥/模型）集中在 cruiser.llm.get_claude_provider_env；
-    此处只负责 claude 自身的运行期开关（沙箱、上下文压缩窗口、逆向环境）。
+    LLM provider configuration (endpoint/key/model) is centralized in cruiser.llm.get_claude_provider_env;
+    this only handles claude's own runtime switches (sandbox, context compaction window, reversing environment).
     """
     env = os.environ.copy()
-    # 提供方配置（ANTHROPIC_BASE_URL / AUTH_TOKEN / MODEL / SMALL_FAST_MODEL）
-    # 注意：单会话 worker 由 main.py 预置 ANTHROPIC_MODEL 指定各自模型，此处会如实沿用。
+    # provider configuration (ANTHROPIC_BASE_URL / AUTH_TOKEN / MODEL / SMALL_FAST_MODEL)
+    # note: for single-session workers main.py presets ANTHROPIC_MODEL to pick each one's model, which is kept as-is here.
     env.update(get_claude_provider_env())
-    env["IS_SANDBOX"] = "1"  # 允许 root 下使用 bypassPermissions
+    env["IS_SANDBOX"] = "1"  # allow bypassPermissions when running as root
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-    # 经 Anthropic 兼容端点接入时，Claude Code 会把非 claude 模型 ID 当作未知模型并假设
-    # 错误的窗口大小（默认 200K），导致 auto-compact 触发时机不当（太晚则撞上真实上限
-    # 报错，太早则频繁压缩浪费）。上下文窗口按提供方取默认值（DeepSeek 1M；GLM 旗舰
-    # glm-5.2/5.3 同为 1M），声明真实窗口后按对应阈值提前压缩；用户显式设置优先。
+    # When connecting through an Anthropic-compatible endpoint, Claude Code treats non-claude model IDs as unknown models and assumes
+    # the wrong window size (200K by default), so auto-compact triggers at the wrong time (too late and it hits the real limit
+    # and errors, too early and it wastes effort compacting often). The context window defaults per provider (DeepSeek 1M; GLM flagship
+    # glm-5.2/5.3 also 1M); declaring the real window makes compaction happen at the matching threshold; explicit user settings take precedence.
     from .llm import get_context_defaults, get_solve_model, provider_for_model
     _model = get_solve_model()
     _max_ctx, _compact_win = get_context_defaults(_model)
     env.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", str(_max_ctx))
     env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(_compact_win))
-    # GLM-5.x（TokenHub）为始终思考模型：裸 Anthropic 协议请求缺省 thinking 会被网关拒绝
-    # （实测报 "该模型始终思考，不支持关闭思考；请使用 low、high 或 max"）。claude CLI
-    # 2.1.x 默认请求已能正常通过，此处显式 setdefault MAX_THINKING_TOKENS 作为防御层：
-    # 兼容不默认携带 thinking 的老版本 CLI，并给思考链一个明确上限（budget 为上限而非
-    # 实际消耗，计费按实际 token；32000 已实测通过 TokenHub 校验，不影响正常输出）。
+    # GLM-5.x (TokenHub) are always-thinking models: a bare Anthropic-protocol request without thinking is rejected by the gateway
+    # (observed error: "this model always thinks; disabling thinking is not supported; use low, high or max"). claude CLI
+    # 2.1.x default requests already pass; setdefault MAX_THINKING_TOKENS here explicitly as a defensive layer:
+    # compatible with older CLIs that do not send thinking by default, and gives the thinking chain an explicit cap (the budget is a cap, not
+    # actual consumption; billing is by actual tokens; 32000 has been verified to pass TokenHub validation and does not affect normal output).
     if provider_for_model(_model) == "glm":
         env.setdefault("MAX_THINKING_TOKENS", "32000")
-    # PyGhidra 运行环境（Ghidra 本体 + JDK），供 Claude 编写的 pyghidra 脚本直接使用
+    # PyGhidra runtime environment (Ghidra itself + JDK), for pyghidra scripts written by Claude to use directly
     env.setdefault("GHIDRA_INSTALL_DIR", "/opt/ghidra_12.1.2_PUBLIC")
     env.setdefault("JAVA_HOME", "/usr/lib/jvm/java-21-openjdk-amd64")
     return env
 
 
 def _extract_text_and_tools(message: dict) -> tuple[str, list[str]]:
-    """从 assistant 事件中提取文本与工具调用摘要（用于进度展示）。"""
+    """Extract text and tool-call summaries from an assistant event (for progress display)."""
     texts: list[str] = []
     tools: list[str] = []
     content = message.get("content")
@@ -746,7 +618,7 @@ def _extract_text_and_tools(message: dict) -> tuple[str, list[str]]:
 
 
 def _iter_tool_result_texts(message: dict) -> list[str]:
-    """从 user 事件（工具结果）中提取全部文本块。"""
+    """Extract all text blocks from a user event (tool results)."""
     out: list[str] = []
     content = message.get("content")
     if isinstance(content, list):
@@ -763,10 +635,10 @@ def _iter_tool_result_texts(message: dict) -> list[str]:
 
 
 def _write_hooks_settings(ws_dir: str) -> None:
-    """在工作目录写入 .claude/settings.json，注册黑板注入钩子。
+    """Write .claude/settings.json in the working directory to register the blackboard injection hooks.
 
-    SessionStart 开局注入一次；PostToolUse 每 10 次工具调用注入一次最新黑板，
-    通过 additionalContext 物理进入模型上下文，不依赖模型自觉读取。
+    SessionStart injects once at the start; PostToolUse injects the latest blackboard every 10 tool calls,
+    physically entering the model context via additionalContext, without relying on the model to read it on its own.
     """
     try:
         claude_dir = os.path.join(ws_dir, ".claude")
@@ -785,7 +657,7 @@ def _write_hooks_settings(ws_dir: str) -> None:
 
 
 def _capture_submitted_flag(message: dict) -> Optional[str]:
-    """若本 assistant 事件调用了 submit_flag.py，提取命令行中的 flag 参数。"""
+    """If this assistant event invoked submit_flag.py, extract the flag argument from the command line."""
     content = message.get("content")
     if not isinstance(content, list):
         return None
@@ -803,12 +675,27 @@ def _capture_submitted_flag(message: dict) -> Optional[str]:
     return None
 
 
-def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: str, quiet: bool, step_counter: list[int], solver_task: Optional[str] = None) -> Optional[str]:
-    """运行一个 Claude 会话直至本题 flag 全部确认 / 达到轮数上限 / 被外部杀死。
+_LEAD_NOTE = (
+    "\n\n[Your role: integration lead] You own the end-to-end solution of this challenge. "
+    "Other sessions and solvers explore in parallel and report into the shared ledger. "
+    "Re-read the solve-state digest and task results regularly, connect their findings, and keep driving "
+    "the next integration step toward the flag; do not only widen the exploration.\n"
+)
 
-    step_counter 为跨会话共享的单元素列表：[COUNT] 计数在多次会话间单调递增，
-    保证 main.py 调度器的步数阈值（可超过单会话 100 轮上限）能够触发。
-    返回确认后的 flag JSON 字符串（仅当平台进度已齐）；未齐或未解出返回 None，由上层开新会话继续。
+_RESUME_TEMPLATE = (
+    "[Scheduler] This is the same conversation, continued in a new scheduling round. "
+    "Your earlier work, files and conclusions are still valid. Current shared solve state:\n\n"
+    "{context}\n\n"
+    "Continue from where you left off. Follow the flag submission protocol given at the start."
+)
+
+
+def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: str, quiet: bool, step_counter: list[int], solver_task: Optional[str] = None) -> Optional[str]:
+    """Run one Claude session until all of this challenge's flags are confirmed / the turn limit is reached / it is killed externally.
+
+    step_counter is a single-element list shared across sessions: the [COUNT] counter increases monotonically across sessions,
+    ensuring the main.py scheduler's step threshold (which may exceed a single session's 100-turn limit) can trigger.
+    Returns the confirmed flag JSON string (only when platform progress is complete); returns None if incomplete or unsolved, and the caller starts a new session to continue.
     """
     root = _project_root()
     reports_dir = os.path.join(os.getcwd(), "reports")
@@ -818,10 +705,10 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     decompile_script = os.path.join(tools_dir, "decompile.py")
     res_dir = os.path.join(root, "resource")
     if solver_task:
-        # solver 定向模式：只做一条方向，用聚焦的系统提示与任务模板
+        # solver directed mode: work on a single direction, with the focused system prompt and task template
         system_prompt = CLAUDE_SOLVER_SYSTEM_PROMPT
         prompt = CLAUDE_SOLVER_TASK_TEMPLATE.format(
-            target=target or "(未提供)",
+            target=target or "(not provided)",
             code=code or "unknown",
             task=solver_task,
             info_file=os.path.join(reports_dir, f"info_{code}.txt"),
@@ -833,9 +720,9 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     else:
         system_prompt = CLAUDE_SYSTEM_PROMPT
         prompt = CLAUDE_TASK_TEMPLATE.format(
-            target=target or "(未提供，先从黑板与提示获取)",
+            target=target or "(not provided; get it from the blackboard and hint first)",
             code=code or "unknown",
-            hint=hint or "暂无",
+            hint=hint or "none",
             info_file=os.path.join(reports_dir, f"info_{code}.txt"),
             hint_file=os.path.join(reports_dir, f"hint_{code}.txt"),
             submit_cmd=submit_cmd,
@@ -843,9 +730,68 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
             decompile_script=decompile_script,
             dirsearch_cmd=dirsearch_cmd,
         )
+    from . import engines, ledger
+    from .opencode_engine import context_block
+    eng = engines.current()
+    eng_name = eng.NAME if eng is not None else "claude"
+    # Explorer slots keep one engine conversation across sessions and stages; solvers always start fresh.
+    slot = None if solver_task else worker_id
+    lead = slot == "1"
+    prior = ledger.session_get(code, slot) if slot else None
+    resume_id = prior.get("id") if prior and prior.get("engine") == eng_name else None
+    if lead:
+        prompt += _LEAD_NOTE
+    if resume_id:
+        resume_prompt = _RESUME_TEMPLATE.format(context=context_block(reports_dir, code) or "(empty)")
+        if lead:
+            resume_prompt += _LEAD_NOTE
+        if eng is not None:
+            cmd = eng.resume_cmd(resume_id, resume_prompt, ws_dir=ws_dir, reports_dir=reports_dir)
+        else:
+            cmd = _claude_cmd(resume_prompt, system_prompt, ws_dir, resume_id=resume_id)
+    elif eng is not None:
+        cmd = eng.session_cmd(prompt, system_prompt, context_block(reports_dir, code),
+                              ws_dir=ws_dir, reports_dir=reports_dir)
+    else:
+        cmd = _claude_cmd(prompt, system_prompt, ws_dir)
+    # no start_new_session: claude and its children stay in this process group,
+    # so the main.py scheduler can reap the whole group with killpg
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL if eng is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL if eng is not None else subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=ws_dir,
+        env=os.environ.copy() if eng is not None else _claude_env(),
+    )
+    events = eng.claude_events(proc.stdout) if eng is not None else _claude_events(proc.stdout)
+    session = {"slot": slot, "engine": eng_name, "last_text": "", "steps": 0}
+    flag_json = _drive_session(proc, events, code, worker_id, quiet, step_counter, session)
+    if resume_id and session["steps"] == 0 and not flag_json:
+        ledger.session_clear(code, slot)  # resume produced nothing: start the next session fresh
+    if solver_task and session["last_text"].strip():
+        # The solver's closing message is its task result: it goes back to the ledger, not into thin air.
+        ledger.add_result(code, worker_id, solver_task, _strip_flag_literals(session["last_text"].strip())[:1500])
+    return flag_json
+
+
+def _claude_events(stdout):
+    for raw in stdout or []:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except Exception:
+            continue
+
+
+def _claude_cmd(prompt: str, system_prompt: str, ws_dir: str, resume_id: Optional[str] = None) -> list[str]:
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        raise RuntimeError("claude CLI 未安装或不在 PATH 中")
+        raise RuntimeError("claude CLI is not installed or not on PATH")
     _write_hooks_settings(ws_dir)
 
     cmd = [
@@ -855,33 +801,29 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         "--verbose",
         "--permission-mode", "bypassPermissions",
         "--append-system-prompt", system_prompt,
-        # CTF 比赛禁止联网检索：从工具集中移除 WebSearch/WebFetch（headless 下 bypassPermissions 会自动放行）。
+        # Online lookup is forbidden in CTF competitions: remove WebSearch/WebFetch from the toolset (in headless mode bypassPermissions would allow them automatically).
         "--disallowedTools", "WebSearch,WebFetch",
     ]
-    # 仅当显式配置了正整数轮数上限时才限制单会话轮数；默认不限制。
+    # limit the per-session turns only when a positive turn limit is explicitly configured; unlimited by default.
     max_turns = _max_turns_per_session()
     if max_turns > 0:
         cmd += ["--max-turns", str(max_turns)]
-    # 不使用 start_new_session：claude 及其子进程留在本进程组，
-    # main.py 调度器 killpg 时可整组回收
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        cwd=ws_dir,
-        env=_claude_env(),
-    )
+    if resume_id:
+        cmd += ["--resume", resume_id]
+    return cmd
 
+
+def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, quiet: bool, step_counter: list[int],
+                   session: Optional[dict] = None) -> Optional[str]:
+    """Consume the engine event stream (claude stream-json shape): count steps, verify flags, trigger the watcher."""
     session_step = 0
     flag_json: Optional[str] = None
     last_submitted_flag = ""
-    confirmed_flag: Optional[str] = None       # 最近一次被平台接受的 flag
-    flag_candidates: "set[str]" = set()        # 会话中出现过的合法 flag 候选（供权威校验）
-    verified: "set[str]" = set()               # 已得到确定性结果的候选（瞬时失败不计入，以便重试）
-    progress = {"correct": 0, "total": 0}      # 平台进度；仅 X>=Y 才结束本会话
-    # 黑板 watcher 状态：滚动活动摘要 + 单 watcher 并发闸（busy 时挂起最新快照，不丢周期）
+    confirmed_flag: Optional[str] = None       # the flag most recently accepted by the platform
+    flag_candidates: "set[str]" = set()        # valid flag candidates seen in the session (for authoritative verification)
+    verified: "set[str]" = set()               # candidates with a definitive result (transient failures excluded so they can be retried)
+    progress = {"correct": 0, "total": 0}      # platform progress; the session ends only when X>=Y
+    # blackboard watcher state: rolling activity summary + single-watcher concurrency gate (while busy, park the latest snapshot so no cycle is lost)
     recent: deque[str] = deque(maxlen=_WATCHER_RECENT_MAX)
     watcher_state = {"busy": False, "pending": None}
     watcher_lock = threading.Lock()
@@ -907,9 +849,9 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         prog = f"{progress['correct']}/{progress['total']}" if progress["total"] >= 1 else "?"
         try:
             if _challenge_done():
-                print(f"\x1b[95;1m[FLAG] 会话 {worker_id} 全部 flag 已齐 ({prog}): {cand}\x1b[0m", flush=True)
+                print(f"\x1b[95;1m[FLAG] session {worker_id} all flags collected ({prog}): {cand}\x1b[0m", flush=True)
             else:
-                print(f"\x1b[93;1m[FLAG PARTIAL] 会话 {worker_id} 进度 {prog}，继续挖掘: {cand}\x1b[0m", flush=True)
+                print(f"\x1b[93;1m[FLAG PARTIAL] session {worker_id} progress {prog}, continuing: {cand}\x1b[0m", flush=True)
         except Exception:
             pass
         fresh = bool(getattr(outcome, "fresh", False))
@@ -926,10 +868,10 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
             if t is not None:
                 flag_method_threads.append(t)
         else:
-            _flag_method_dbg(f"note_outcome 不写条目: fresh=False worker={worker_id} prog={prog}")
+            _flag_method_dbg(f"note_outcome no entry written: fresh=False worker={worker_id} prog={prog}")
 
     def _apply_outcome(cand: str, outcome) -> bool:
-        """应用一次提交结果。返回 True 当且仅当本题 flag 已全部确认。"""
+        """Apply one submission result. Returns True if and only if all of this challenge's flags are confirmed."""
         if outcome.definitive:
             verified.add(cand)
         if outcome.ok:
@@ -937,7 +879,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         return _challenge_done()
 
     def _verify_flag(cand: str) -> bool:
-        """权威校验：框架亲自向平台提交。True 只表示本题已齐，不是「这一枚对了」。"""
+        """Authoritative verification: the framework submits to the platform itself. True only means the challenge is complete, not "this one is correct"."""
         from .tools import looks_flaglike
         if not code or not cand or not looks_flaglike(cand):
             return _challenge_done()
@@ -946,7 +888,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         return _apply_outcome(cand, _submit_flag_directly(code, cand))
 
     def _ingest_cands(cands: list[str]) -> bool:
-        """按顺序提交本批候选。第一枚正确但未齐时继续交后续；齐了才返回 True。"""
+        """Submit this batch of candidates in order. If the first is correct but the set is incomplete, keep submitting the rest; returns True only when complete."""
         seen: set[str] = set()
         for fm in cands:
             if not fm or fm in seen:
@@ -963,16 +905,16 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         flag_json = json.dumps({"flag": confirmed_flag}, ensure_ascii=False)
 
     def _absorb_tool_progress(text: str) -> None:
-        """模型自己调用 submit_flag.py 的回执里若带 X/Y，同步进 progress（覆盖形态过滤漏掉的串）。"""
+        """If the receipt of the model's own submit_flag.py call carries X/Y, sync it into progress (covers strings missed by the shape filter)."""
         if not any(marker in (text or "") for marker in _FLAG_OK_MARKERS):
             return
         c, t = _progress_from_text(text)
         if t >= 1:
             progress["correct"] = max(progress["correct"], c)
             progress["total"] = max(progress["total"], t)
-        if "提交flag正确" in (text or "") and "已经提交成功过了" not in (text or ""):
+        if "FLAG CORRECT" in (text or "") and "ALREADY SUBMITTED" not in (text or ""):
             _flag_method_dbg(
-                f"absorb 模型提交正确 worker={worker_id} progress={progress} "
+                f"absorb model submission correct worker={worker_id} progress={progress} "
                 f"recent_n={len(recent)} text_head={(text or '')[:80]!r}"
             )
             t = _spawn_flag_method_writer(
@@ -1009,26 +951,26 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
                     return
 
     try:
-        for raw in proc.stdout or []:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                evt = json.loads(line)
-            except Exception:
-                continue
+        for evt in events:
             etype = evt.get("type")
-            if etype == "assistant":
+            if etype == "system" and evt.get("session_id") and session and session.get("slot"):
+                from . import ledger
+                ledger.session_set(code, session["slot"], session["engine"], str(evt["session_id"]))
+            elif etype == "assistant":
                 session_step += 1
                 step_counter[0] += 1
+                if session is not None:
+                    session["steps"] = session_step
                 print(f"[COUNT] {step_counter[0]}", flush=True)
                 msg = evt.get("message") or {}
                 text, tools = _extract_text_and_tools(msg)
+                if session is not None and text.strip():
+                    session["last_text"] = text
                 if not quiet:
                     for t in tools:
                         print(f"[TOOL] {t}", flush=True)
                     if text.strip():
-                        # 压成单行，避免 Thought 里的 JSON 被父进程按行误判为最终 {"flag"}
+                        # collapse to one line so JSON inside a Thought is not misread line-by-line by the parent process as the final {"flag"}
                         preview = text.strip()[:300].replace("\n", " ").replace("\r", " ")
                         print(f"[Claude] {preview}", flush=True)
                 digest_parts = []
@@ -1064,10 +1006,10 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
                     _mark_done(confirmed_flag or last_submitted_flag or "ok")
                     break
             elif etype == "result":
-                # 会话结束（success / error_max_turns / error_*）
+                # session ended (success / error_max_turns / error_*)
                 if not quiet:
                     subtype = evt.get("subtype") or ""
-                    print(f"[Session] Claude 会话结束: {subtype}", flush=True)
+                    print(f"[Session] Claude session ended: {subtype}", flush=True)
                 break
     finally:
         if proc.poll() is None:
@@ -1075,17 +1017,17 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
                 proc.kill()
             except Exception:
                 pass
-        # 首次提交的 [flag方法] 分叉优先收尾，避免会话退出时 daemon 被直接丢掉
+        # let the [flag-method] fork from the first submission finish first, so the daemon is not dropped when the session exits
         for t in flag_method_threads:
             try:
-                _flag_method_dbg(f"join 等待 {t.name} alive={t.is_alive()}")
+                _flag_method_dbg(f"join waiting {t.name} alive={t.is_alive()}")
                 t.join(timeout=25)
-                _flag_method_dbg(f"join 结束 {t.name} alive={t.is_alive()}")
+                _flag_method_dbg(f"join done {t.name} alive={t.is_alive()}")
             except Exception as e:
-                _flag_method_dbg(f"join 异常 {t.name} {type(e).__name__}: {e}")
-        # 收尾：会话结束（出 flag / 达轮数上限 / 自然结束）时强制再采集一次，
-        # 补齐"最后一次周期 watcher 之后"到会话结束之间的尾部新发现（否则会漏采）。
-        # 同步执行但带超时：避免子进程退出前 daemon watcher 线程被杀导致丢失，同时防止 LLM 卡死拖住回收。
+                _flag_method_dbg(f"join error {t.name} {type(e).__name__}: {e}")
+        # wrap-up: when the session ends (flag found / turn limit reached / natural end), force one more collection,
+        # to capture the trailing new findings between "after the last periodic watcher" and the end of the session (otherwise they would be missed).
+        # run synchronously with a timeout: avoids losing it when the daemon watcher thread is killed before the subprocess exits, while preventing a hung LLM from blocking cleanup.
         if code and recent:
             snapshot = _format_watcher_activity(recent)
             try:
@@ -1099,7 +1041,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
 
     if flag_json:
         return flag_json
-    # 会话结束：对本会话见过的候选全部补交（不因第一枚正确就停），仅当平台进度已齐才返回 JSON。
+    # session over: submit every candidate seen in this session (do not stop at the first correct one); return JSON only when platform progress is complete.
     if code:
         last_ok = confirmed_flag
         for cand in sorted((c for c in flag_candidates if _looks_like_flag(c)), key=len, reverse=True):
@@ -1110,7 +1052,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
                 last_ok = last_ok or cand
         if _challenge_done():
             try:
-                print(f"\x1b[95;1m[FLAG RECOVERED] 会话结束后程序化补交，进度已齐: {last_ok}\x1b[0m", flush=True)
+                print(f"\x1b[95;1m[FLAG RECOVERED] programmatic submission after session end, progress complete: {last_ok}\x1b[0m", flush=True)
             except Exception:
                 pass
             return json.dumps({"flag": last_ok or "ok"}, ensure_ascii=False)
@@ -1118,29 +1060,32 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
 
 
 def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Optional[str] = None, challenge_code: Optional[str] = None, solver_task: Optional[str] = None) -> str:
-    """运行 Claude Code 自动扫描，直到本题全部 flag 被平台确认（或被外部调度器终止）。
+    """Run the Claude Code auto scan until all of this challenge's flags are confirmed by the platform (or it is terminated by the external scheduler).
 
-    - 返回值为含 flag 字段的 JSON 字符串（仅当平台进度已齐）；
-    - max_steps 不在此强制终止（步数阈值由 main.py 调度器通过 [COUNT] 监控执行）；
-    - 单枚正确但未齐时会话继续；会话自然结束后基于黑板成果开新会话继续挖剩余 flag。
+    - The return value is a JSON string with a flag field (only when platform progress is complete);
+    - max_steps is not enforced here (the step threshold is enforced by the main.py scheduler monitoring [COUNT]);
+    - When one flag is correct but the set is incomplete the session continues; after a session ends naturally, a new session builds on the blackboard to hunt the remaining flags.
 
-    solver 模式（solver_task 非空）：只跑一个聚焦该方向的会话即返回，不循环开新会话；
-    回合(turn)上限由环境变量 CRUISER_MAX_TURNS 控制（main.py 的 solver 驱动设为 40）。
-    注意：这是 claude 的回合(turn)数，非日志里的 [COUNT]（[COUNT] 约为其数倍）。
+    Solver mode (solver_task non-empty): runs a single session focused on that direction and returns, without looping into new sessions;
+    the turn limit is controlled by the CRUISER_MAX_TURNS environment variable (main.py's solver driver sets it to 40).
+    Note: this is claude's turn count, not the [COUNT] in the log ([COUNT] is roughly several times larger).
     """
-    if shutil.which("claude") is None:
-        return json.dumps({"flag": None, "error": "claude CLI 未安装"}, ensure_ascii=False)
+    from . import engines
+    eng = engines.current()
+    engine_bin = eng.BINARY_NAME if eng is not None else "claude"
+    if shutil.which(engine_bin) is None:
+        return json.dumps({"flag": None, "error": f"{engine_bin} CLI is not installed"}, ensure_ascii=False)
 
     worker_id = os.environ.get("CRUISER_WORKER_ID", "single")
     code = challenge_code or os.environ.get("CRUISER_CHALLENGE_CODE") or ""
     ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR") or ""
     if not ws_dir:
-        base_ws = "/tmp/cruiser_workspaces"
+        base_ws = os.environ.get("CRUISER_WORKSPACE_BASE") or "/tmp/cruiser_workspaces"
         os.makedirs(base_ws, exist_ok=True)
         ws_dir = os.path.join(base_ws, f"ws_claude_{uuid.uuid4().hex[:8]}")
     os.makedirs(ws_dir, exist_ok=True)
 
-    # solver 定向模式：只跑一个会话，完成/达轮数上限即返回，不循环
+    # solver directed mode: run only one session, return when done / turn limit reached, no loop
     if solver_task:
         try:
             flag_json = _run_one_session(
@@ -1160,7 +1105,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
         return json.dumps({"flag": None}, ensure_ascii=False)
 
     attempt = 0
-    step_counter = [0]  # 跨会话单调递增的全局步数计数器
+    step_counter = [0]  # global step counter, monotonically increasing across sessions
     while True:
         attempt += 1
         try:
@@ -1177,7 +1122,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
             raise
         except Exception as e:
             try:
-                print(f"[Error] Claude 会话异常: {e}", flush=True)
+                print(f"[Error] Claude session error: {e}", flush=True)
             except Exception:
                 pass
             time.sleep(5)
@@ -1190,7 +1135,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
             return flag_json
         try:
             _mt = _max_turns_per_session()
-            _limit_desc = f"{_mt} 轮上限" if _mt > 0 else "会话自然结束"
-            print(f"[Session] 第 {attempt} 个会话未齐（{_limit_desc}），基于黑板成果开启新会话…", flush=True)
+            _limit_desc = f"{_mt}-turn limit" if _mt > 0 else "session ended naturally"
+            print(f"[Session] session #{attempt} incomplete ({_limit_desc}), starting a new session from the blackboard results...", flush=True)
         except Exception:
             pass

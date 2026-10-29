@@ -1,7 +1,7 @@
-"""Cruiser 演示靶场：一个带路径穿越漏洞的「笔记查看器」。
+"""Cruiser demo target: a "note viewer" with a path traversal vulnerability.
 
-flag 来自环境变量 FLAG，启动时写到笔记目录的上一级（flag.txt）。
-漏洞：/view?name= 未做校验直接拼进路径，../flag.txt 即可读到 flag。
+The flag comes from the FLAG environment variable and is written one level above the notes directory (flag.txt) at startup.
+Vulnerability: /view?name= is concatenated into the path without validation, so ../flag.txt reads the flag.
 """
 import os
 import tempfile
@@ -13,7 +13,7 @@ DATA_DIR = tempfile.mkdtemp(prefix="cruiser_demo_")
 NOTES_DIR = os.path.join(DATA_DIR, "notes")
 os.makedirs(NOTES_DIR)
 with open(os.path.join(NOTES_DIR, "welcome.txt"), "w", encoding="utf-8") as f:
-    f.write("欢迎使用笔记查看器。\n")
+    f.write("Welcome to the note viewer.\n")
 with open(os.path.join(DATA_DIR, "flag.txt"), "w", encoding="utf-8") as f:
     f.write(os.environ.get("FLAG", "flag{not_configured}") + "\n")
 
@@ -26,7 +26,7 @@ def index():
 
 @app.route("/view")
 def view():
-    path = os.path.join(NOTES_DIR, request.args.get("name", ""))  # 漏洞：未校验路径
+    path = os.path.join(NOTES_DIR, request.args.get("name", ""))  # vulnerability: the path is not validated
     try:
         with open(path, "rb") as f:
             return f.read(), 200, {"Content-Type": "text/plain; charset=utf-8"}

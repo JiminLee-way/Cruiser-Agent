@@ -1,7 +1,7 @@
 """Cruiser package init.
 
-全局禁用 LangSmith/LangChain 追踪以避免外网请求与配额问题。
-在导入任何子模块前执行，确保子进程默认也继承禁用状态。
+Globally disable LangSmith/LangChain tracing to avoid outbound requests and quota issues.
+Runs before any submodule is imported, so subprocesses inherit the disabled state by default.
 
 """
 
@@ -10,20 +10,20 @@ from __future__ import annotations
 import os
 
 
-# 强制关闭追踪（覆盖外部环境设置）
+# Force tracing off (overrides external environment settings)
 os.environ["LANGSMITH_TRACING"] = "false"
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
-# 同时移除可能存在的 API Key，避免误触发 SDK 初始化
+# Also remove any API keys that may be present, to avoid accidentally triggering SDK initialization
 for _k in ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"):
     os.environ.pop(_k, None)
 
 
 def _load_dotenv() -> None:
-    """加载项目根目录的 .env（若存在）；不覆盖已存在的环境变量。
+    """Load the project-root .env (if present); never overrides existing environment variables.
 
-    用于提供 DEEPSEEK_API_KEY 等 LLM 密钥与 CRUISER_* 配置，
-    保证 main.py 及其 spawn 的子进程都能拿到凭证。
+    Supplies LLM keys such as DEEPSEEK_API_KEY and CRUISER_* settings,
+    so main.py and the subprocesses it spawns all get the credentials.
     """
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
