@@ -9,7 +9,7 @@ import os
 import re
 import time
 import uuid
-from typing import Callable, Literal, NotRequired, Optional, TypedDict, TypeVar
+from typing import Callable, Literal, Optional, TypedDict, TypeVar
 
 from .flagshape import PLACEHOLDER, redact
 
@@ -23,14 +23,24 @@ class StatusChange(TypedDict):
     by: str
 
 
-class Entry(TypedDict):
+class _EntryBase(TypedDict):
     id: str
     ts: str
     author: str
-    kind: Kind
     text: str
-    task: NotRequired[str]
     history: list[StatusChange]
+
+
+class FactEntry(_EntryBase):
+    kind: Literal["fact", "flag_method"]
+
+
+class ResultEntry(_EntryBase):
+    kind: Literal["result"]
+    task: str
+
+
+Entry = FactEntry | ResultEntry
 
 
 _NEXT: dict[str, frozenset[str]] = {
@@ -238,7 +248,7 @@ def _public(e: Entry) -> dict:
     out = {"id": e["id"], "ts": e["ts"], "author": e["author"], "kind": e["kind"], "text": e["text"],
            "status": _status(e), "notes": _notes(e)}
     if e["kind"] == "result":
-        out["task"] = e.get("task", "")
+        out["task"] = e["task"]
     return out
 
 
@@ -270,7 +280,7 @@ def add_result(code: str, author: str, task: str, text: str) -> Optional[str]:
 
 def has_result(code: str, author: str, task: str) -> bool:
     task = _clean(task, _TASK_CAP)
-    return any(e["kind"] == "result" and e["author"] == author and e.get("task") == task for e in _load_or_empty(code).entries)
+    return any(e["kind"] == "result" and e["author"] == author and e["task"] == task for e in _load_or_empty(code).entries)
 
 
 def set_status(code: str, entry_id: str, status: str, note: str = "", by: str = "") -> bool:
