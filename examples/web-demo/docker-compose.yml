@@ -1,0 +1,7 @@
+services:
+  web:
+    build: .
+    environment:
+      FLAG: "flag{cruiser_local_demo_path_traversal}"
+    ports:
+      - "127.0.0.1:8081:5000"
