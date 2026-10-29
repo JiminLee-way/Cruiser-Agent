@@ -57,7 +57,7 @@ _FROZEN_KINDS = frozenset({"flag_method"})
 _FACT_KINDS = ("fact", "flag_method")
 _KIND_TAG = {"fact": "", "flag_method": "[flag-method] ", "result": "[task-result] "}
 _STATUS_TAG = {"verified": "[verified] ", "disputed": "[disputed] "}
-_CONFIDENCE_TAG: dict[Confidence, str] = {"observed": "", "inferred": "[inferred] "}
+CONFIDENCE_TAG: dict[Confidence, str] = {"observed": "", "inferred": "[inferred] "}
 _ID_PREFIX = {"fact": "f", "flag_method": "f", "result": "r"}
 _TEXT_CAP = {"fact": 400, "flag_method": 400, "result": 1500}
 _NOTE_CAP = 300
@@ -246,7 +246,7 @@ def _view_line(e: Entry) -> str:
     body = f"{e['task'][:80]} -> {e['text']}" if e.get("task") else e["text"]
     notes = _notes(e)
     tail = f" ({'; '.join(notes)})" if notes else ""
-    tags = f"{_KIND_TAG[e['kind']]}{_STATUS_TAG.get(_status(e), '')}{_CONFIDENCE_TAG.get(e.get('confidence'), '')}"
+    tags = f"{_KIND_TAG[e['kind']]}{_STATUS_TAG.get(_status(e), '')}{CONFIDENCE_TAG.get(e.get('confidence'), '')}"
     return _flatten(f"{tags}{e['id']} {body}{tail}{basis_suffix(e.get('basis', []))}")
 
 
@@ -302,6 +302,10 @@ def add_result(code: str, author: str, task: str, text: str, basis: Iterable[str
     if not code:
         return None
     return _commit(code, lambda led: led.add(author, "result", text, task, basis=basis))
+
+
+def live_ids(code: str, ids: Iterable[str]) -> list[str]:
+    return _load_or_empty(code).live_ids(ids)
 
 
 def has_result(code: str, author: str, task: str) -> bool:

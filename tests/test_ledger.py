@@ -194,7 +194,7 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
         "dispute": [{"id": lead, "reason": "not the seed of the solved grid"}],
         "supersede": [],
         "digest": "GOAL: DH{...}\nOPEN LEADS: f-lead seed",
-        "suggest_tasks": [{"text": "derive the output from the seed lead", "basis": lead}],
+        "suggest_tasks": [{"text": "derive the output from the seed lead", "basis_ids": [lead]}],
         "retire_tasks": [],
     }
 
@@ -213,7 +213,7 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
     assert "grid columns 0-3 are [1, 2, 3, 4]" in texts
     assert not any("should_never_be_stored_here" in t for t in texts)
     assert ledger.digest("T-1").startswith("GOAL")
-    assert any(lead in t["text"] for t in taskboard.list_tasks("T-1"))
+    assert [t["basis_ids"] for t in taskboard.list_tasks("T-1")] == [[lead]]
 
 
 def _codex_cmds(monkeypatch) -> dict[str, list[str]]:

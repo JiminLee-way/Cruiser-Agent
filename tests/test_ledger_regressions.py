@@ -100,15 +100,57 @@ def test_only_the_lead_watcher_rewrites_the_digest(reports, run_watcher, worker)
     assert ledger.digest(CODE) == "GOAL: rewritten by the lead"
 
 
-def test_watcher_does_not_store_a_dict_add_item(reports, run_watcher):
-    run_watcher("2", {"add": [{"text": "grid is 9x9"}, "lead: seed 0x1234 gives the prefix"]})
-    assert [f["text"] for f in ledger.facts(CODE)] == ["lead: seed 0x1234 gives the prefix"]
+def test_watcher_add_items_carry_basis_ids_and_confidence(reports, run_watcher):
+    known = ledger.add_fact(CODE, "1", "the grid is read from /static/grid.bin")
+    run_watcher("2", {"add": [
+        {"text": "grid is 9x9", "basis_ids": [known, "f-unknwn", 7, ""], "confidence": "inferred"},
+        {"text": "the cookie is signed", "basis_ids": known, "confidence": ["inferred"]},
+        {"text": "flag{never_stored_here}", "confidence": "observed"},
+        {"basis_ids": [known]},
+        {"text": "lead: seed 0x1234 gives the prefix", "confidence": "certain"},
+    ]})
+    rows = {f["text"]: (f["basis"], f["confidence"]) for f in ledger.facts(CODE) if f["id"] != known}
+    assert rows == {
+        "grid is 9x9": ([known], "inferred"),
+        "the cookie is signed": ([], ""),
+        "lead: seed 0x1234 gives the prefix": ([], ""),
+    }
+
+
+def test_published_direction_keeps_only_live_basis_ids(reports, run_watcher):
+    lead = ledger.add_fact(CODE, "1", "lead: seed 0x1234 gives the prefix")
+    run_watcher("2", {"suggest_tasks": [
+        {"text": "derive the output from the seed", "basis_ids": [lead, "f-unknwn"]},
+        {"text": "dump the session table", "basis_ids": "f-aaaaaa"},
+    ]})
+    tasks = {t["text"]: t["basis_ids"] for t in taskboard.list_tasks(CODE)}
+    assert tasks == {f"derive the output from the seed (from {lead})": [lead], "dump the session table": []}
+
+
+def test_watcher_view_shows_basis_and_inferred_tags(reports, run_watcher, monkeypatch):
+    seen: list[str] = []
+    known = ledger.add_fact(CODE, "1", "the grid is read from /static/grid.bin")
+    fid = ledger.add_fact(CODE, "1", "grid is 9x9", basis=[known], confidence="inferred")
+    rid = ledger.add_result(CODE, "solver3", "parse the grid", "rows are 9 bytes", basis=[fid])
+
+    class FakeLLM:
+        def invoke(self, messages):
+            seen.append("\n".join(m.content for m in messages))
+            return SimpleNamespace(content="{}")
+
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+    claude_agent._watcher_curate_blackboard(CODE, "2", "Thought: read the grid", str(reports))
+    [prompt] = seen
+    [fact_row] = [ln for ln in prompt.splitlines() if ln.startswith(f"- {fid} ")]
+    [result_row] = [ln for ln in prompt.splitlines() if ln.startswith(f"- {rid} ")]
+    assert "[inferred]" in fact_row and fact_row.endswith(f" (from {known})")
+    assert result_row.endswith(f" (from {fid})")
 
 
 def test_watcher_does_not_publish_a_task_without_text(reports, run_watcher):
     run_watcher("2", {"suggest_tasks": [
-        {"basis": "f-aaaaaa"},
-        {"text": "derive the output from the seed", "basis": "f-bbbbbb"},
+        {"basis_ids": ["f-aaaaaa"]},
+        {"text": "derive the output from the seed", "basis_ids": ["f-bbbbbb"]},
     ]})
     tasks = [t["text"] for t in taskboard.list_tasks(CODE)]
     assert len(tasks) == 1 and tasks[0].startswith("derive the output from the seed"), tasks
