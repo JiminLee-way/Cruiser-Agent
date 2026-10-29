@@ -22,6 +22,7 @@ from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from .flagshape import FLAG_RE, redact
 from .llm import get_claude_provider_env, get_watcher_llm
 from .prompt import (
     CLAUDE_SOLVER_SYSTEM_PROMPT,
@@ -67,9 +68,6 @@ _FLAG_OK_MARKERS = ("FLAG CORRECT", "ALREADY SUBMITTED")
 _SUBMIT_INVOKE_RE = re.compile(
     r"""(?:^|[\s;|&])(?:\S*/)?submit_flag\.py\s+([A-Za-z0-9]+-\d+)\s+(?:'([^']+)'|"([^"]+)"|([^\s'"|;&><`]+))"""
 )
-# flag{...}-shaped candidate extraction
-# Only extract "real-flag-like wrapper + content": reject snippets like startswith('flag{') in source code running to the next }
-_FLAG_PATTERN_RE = re.compile(r"[A-Za-z0-9_]{2,20}\{[A-Za-z0-9_+\-./:=]{8,300}\}")
 
 
 # More than this many flag{...} in one text blob is treated as brute-force/enumeration output and is never auto-submitted.
@@ -82,7 +80,7 @@ def _unique_flag_cands(text: str) -> list[str]:
     """Extract deduplicated valid flag candidates from a text, preserving order of appearance."""
     out: list[str] = []
     seen: set[str] = set()
-    for m in _FLAG_PATTERN_RE.findall(text or ""):
+    for m in FLAG_RE.findall(text or ""):
         if not _looks_like_flag(m) or m in seen:
             continue
         seen.add(m)
@@ -199,11 +197,6 @@ def _get_watcher_llm():
     return _WATCHER_LLM
 
 
-def _strip_flag_literals(text: str) -> str:
-    """Strip concrete flag strings so that, once written to the blackboard, they are not repeatedly sent to the platform by the fallback submission."""
-    return _FLAG_PATTERN_RE.sub("<flag>", text or "")
-
-
 def _format_watcher_activity(recent: deque[str] | list[str], budget: int = _WATCHER_ACTIVITY_CHARS) -> str:
     """Build the watcher activity window: the most recent items in full, older ones shortened (keeping a head and tail), all within budget."""
     items = [x for x in recent if x]
@@ -289,7 +282,7 @@ _FLAG_METHOD_SPAWNED_LOCK = threading.Lock()
 
 def _compose_flag_method(prog: str, activity: str) -> str:
     """Condense the activity summary into one complete [flag-method] entry in a single call; falls back to a compressed summary when the LLM is unavailable."""
-    activity = _strip_flag_literals(activity or "")
+    activity = redact(activity or "")
     llm = _get_watcher_llm()
     _flag_method_dbg(
         f"compose start prog={prog} llm={'yes' if llm is not None else 'None'} "
@@ -316,7 +309,7 @@ def _compose_flag_method(prog: str, activity: str) -> str:
                     break
             if not line and (text or "").strip():
                 line = text.strip().splitlines()[0].strip()
-            line = _strip_flag_literals(line)
+            line = redact(line)
             if line:
                 if not _is_flag_method(line):
                     line = f"[flag-method] progress {prog}. {line}"
@@ -510,7 +503,7 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None
         n_add = n_ver = n_dis = n_sup = 0
         for info in _items("add", 3):
             info = str(info).strip()
-            if _FLAG_PATTERN_RE.search(info):
+            if FLAG_RE.search(info):
                 continue  # an entry that is a flag-like literal carries no reusable fact
             if info and not _is_flag_method(info) and ledger.add_fact(code, worker_id, info):
                 n_add += 1
@@ -519,13 +512,13 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None
                 n_ver += 1
         for d in _items("dispute", 3):
             if isinstance(d, dict) and str(d.get("id")) in editable and str(d.get("reason") or "").strip():
-                if ledger.set_status(code, str(d["id"]), "disputed", _strip_flag_literals(str(d["reason"])), worker_id):
+                if ledger.set_status(code, str(d["id"]), "disputed", redact(str(d["reason"])), worker_id):
                     n_dis += 1
         for u in _items("supersede", 3):
             if isinstance(u, dict) and str(u.get("id")) in editable and str(u.get("new") or "").strip():
-                if ledger.supersede(code, str(u["id"]), _strip_flag_literals(str(u["new"])), worker_id):
+                if ledger.supersede(code, str(u["id"]), redact(str(u["new"])), worker_id):
                     n_sup += 1
-        new_digest = _strip_flag_literals(str(obj.get("digest") or "").strip())
+        new_digest = redact(str(obj.get("digest") or "").strip())
         if new_digest:
             ledger.set_digest(code, worker_id, new_digest)
 
@@ -773,7 +766,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
         ledger.session_clear(code, slot)  # resume produced nothing: start the next session fresh
     if solver_task and session["last_text"].strip():
         # The solver's closing message is its task result: it goes back to the ledger, not into thin air.
-        ledger.add_result(code, worker_id, solver_task, _strip_flag_literals(session["last_text"].strip())[:1500])
+        ledger.add_result(code, worker_id, solver_task, redact(session["last_text"].strip())[:1500])
     return flag_json
 
 

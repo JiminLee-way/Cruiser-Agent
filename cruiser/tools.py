@@ -24,6 +24,7 @@ import re
 import requests
 
 from .challenges import PlatformError, UnknownChallenge, get_platform
+from .flagshape import FLAG_RE
 
 # Green console printing (Windows-compatible where possible)
 _COLORAMA_READY = False
@@ -482,7 +483,6 @@ def _flag_norm(flag: str) -> str:
 #   3. prefix learning: once the flagstore holds platform-confirmed correct flags, a new candidate's prefix must match
 #      the set of confirmed prefixes (this platform uses uniform prefixes, e.g. flag{/FLAG{); a confirmed prefix is exempt from the blacklist.
 # ---------------------------------------------------------------------------
-_FLAG_FULL_RE = re.compile(r"[A-Za-z0-9_]{2,20}\{[A-Za-z0-9_+\-./:=]{8,300}\}")
 
 # Common template placeholders (lowercase): the model sometimes echoes the flag format examples from the prompt verbatim
 _PLACEHOLDER_FLAGS = {
@@ -521,7 +521,7 @@ _TRUSTED_PREFIXES = {"flag"}
 
 def _flag_shape_ok(s: str) -> bool:
     """Basic shape: PREFIX{body} charset + not a placeholder."""
-    if not _FLAG_FULL_RE.fullmatch(s):
+    if not FLAG_RE.fullmatch(s):
         return False
     return s.lower() not in _PLACEHOLDER_FLAGS
 

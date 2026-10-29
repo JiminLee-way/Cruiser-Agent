@@ -14,6 +14,8 @@ import time
 import uuid
 from typing import Optional
 
+from .flagshape import redact
+
 _MAX_PENDING = 5  # maximum number of pending directions on the board; nothing more is published beyond this
 _TASK_LINE_RE = re.compile(r"^\[(t-[0-9a-f]{6})\]\s*(.*)$")
 # Claim memory duration: a direction erased by a claim still takes part in dedup for this long (prevents the watcher from republishing it);
@@ -116,7 +118,7 @@ def list_claimed(code: str, ttl_s: float = _CLAIMED_TTL_S) -> list[dict]:
 def publish_task(code: str, text: str) -> bool:
     """Watcher publishes a direction: deduplicated against "pending board + recently claimed"; nothing is published when the board is full (>=5).
     Returns whether anything was actually written."""
-    text = (text or "").strip()
+    text = redact(text).strip()
     if not code or not text:
         return False
     os.makedirs(_reports_dir(), exist_ok=True)
