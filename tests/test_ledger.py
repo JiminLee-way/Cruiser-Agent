@@ -111,9 +111,13 @@ def test_engines_announce_session_ids():
     assert opencode_engine.resume_cmd.__name__ and "--session" in opencode_engine._run_cmd("m", "x", "ses_1")
 
 
-def test_watcher_applies_statuses_by_id_and_never_deletes(reports, monkeypatch):
+def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, monkeypatch):
     from cruiser import claude_agent, taskboard
     monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
+    monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     lead = ledger.add_fact("T-1", "solver11", "lead: seed 0xab5e313b gives the known prefix")
     keep = ledger.add_fact("T-1", "1", "bytecode is 2200 records of 8 bytes")
     reply = {
@@ -133,7 +137,7 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, monkeypatch):
             return R()
 
     monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
-    claude_agent._watcher_curate_blackboard("T-1", "w1", "Thought: tried things\nAction: shell: ls")
+    claude_agent._watcher_curate_blackboard("T-1", claude_agent.LEAD_SLOT, "Thought: tried things\nAction: shell: ls")
     by_id = {f["id"]: f for f in ledger.facts("T-1")}
     assert by_id[lead]["status"] == "disputed" and "0xab5e313b" in by_id[lead]["text"]
     assert by_id[keep]["status"] == "verified"

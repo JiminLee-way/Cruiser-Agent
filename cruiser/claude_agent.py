@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -145,7 +146,7 @@ _WATCHER_SYSTEM = (
 
 _WATCHER_PROMPT_TEMPLATE = (
     "[Ledger entries (id status author content)]\n{blackboard}\n\n"
-    "[Directed task results]\n{results}\n\n"
+    "[Directed task results (id status author direction -> conclusion)]\n{results}\n\n"
     "[Exploration directions currently waiting to be claimed]\n{tasks}\n"
     "[Directions in progress (already claimed by other sessions)]\n{claimed_tasks}\n\n"
     "[Current solving-state digest]\n{digest}\n\n"
@@ -155,8 +156,8 @@ _WATCHER_PROMPT_TEMPLATE = (
     "write ones that have a concrete value but are not yet confirmed as \"lead: ...\"; at most 120 characters each, at most 3 per call; do not repeat what the ledger already has; "
     "do not record basic information such as server fingerprints or version numbers (unless tied to a specific vulnerability); do not hard-code concrete IP:port (it changes when the container restarts), write endpoints only as relative paths or logical names; "
     "[Never write concrete flag values] never write flag{{...}}, FLAG{{...}} or any other flag-like string;\n"
-    "2. verify: ids of entries reproduced or confirmed by replay in the recent activity;\n"
-    "3. dispute: entries refuted by the recent activity or considered not applicable [{{\"id\": \"f-...\", \"reason\": \"...\"}}]; "
+    "2. verify: ids of entries or task results (f-... / r-...) reproduced or confirmed by replay in the recent activity;\n"
+    "3. dispute: entries or task results refuted by the recent activity or considered not applicable [{{\"id\": \"f-... or r-...\", \"reason\": \"...\"}}]; "
     "entries are never deleted -- concrete values in a disputed entry may still be key leads, so state the basis of the reason clearly;\n"
     "4. supersede: entries whose content needs correcting or completing [{{\"id\": \"f-...\", \"new\": \"the complete corrected content\"}}];\n"
     "5. digest: rewrite the complete digest (not a delta) based on all ledger entries and task results, with fixed sections: "
@@ -172,6 +173,17 @@ _WATCHER_PROMPT_TEMPLATE = (
     '"supersede": [{{"id": "", "new": ""}}], "digest": "", '
     '"suggest_tasks": [{{"text": "", "basis": ""}}], "retire_tasks": []}}'
 )
+
+_WATCHER_NO_DIGEST = "\nThe solve-state digest is maintained by the lead session's watcher: always return digest as an empty string."
+
+# Slot "1" is the integration lead; "single" is the only session of a one-worker run. Only their watchers write the digest.
+LEAD_SLOT = "1"
+SINGLE_WORKER_ID = "single"
+
+
+def _owns_digest(worker_id: str) -> bool:
+    return worker_id in (LEAD_SLOT, SINGLE_WORKER_ID)
+
 
 _WATCHER_LLM = None
 _WATCHER_LLM_LOCK = threading.Lock()
@@ -407,40 +419,111 @@ def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optiona
 def _format_ledger_for_watcher(code: str) -> tuple[str, str]:
     """Watcher view of ledger entries and task results: (entries text, results text), keeping the newest part when over budget."""
     from . import ledger
-    status_tag = {"verified": "verified", "disputed": "disputed", "open": "open"}
-    rows = []
-    for f in ledger.facts(code):
-        note = f" ({'; '.join(f['notes'])})" if f["notes"] else ""
-        rows.append(f"- {f['id']} [{status_tag.get(f['status'], f['status'])}] ({f['author']}) {f['text']}{note}")
-    res = [f"- {r.get('id')} ({r.get('author')}) direction '{r.get('task', '')[:80]}' -> {r.get('text', '')[:400]}"
+
+    def _notes(e: dict) -> str:
+        return f" ({'; '.join(e['notes'])})" if e["notes"] else ""
+
+    rows = [f"- {f['id']} [{f['status']}] ({f['author']}) {'[flag-method] ' if f['kind'] == 'flag_method' else ''}{f['text']}{_notes(f)}"
+            for f in ledger.facts(code)]
+    res = [f"- {r['id']} [{r['status']}] ({r['author']}) direction '{r['task'][:80]}' -> {r['text'][:400]}{_notes(r)}"
            for r in ledger.results(code)[-12:]]
-    facts_text = "\n".join(rows) or "(empty)"
-    return facts_text[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
+    return ("\n".join(rows) or "(empty)")[-_WATCHER_BB_CHARS:], ("\n".join(res) or "(empty)")[-_WATCHER_TASKS_CHARS:]
+
+
+@dataclass(frozen=True)
+class WatcherReply:
+    add: tuple[str, ...] = ()
+    verify: tuple[str, ...] = ()
+    dispute: tuple[tuple[str, str], ...] = ()    # (entry id, reason)
+    supersede: tuple[tuple[str, str], ...] = ()  # (entry id, corrected text)
+    digest: str = ""
+    suggest_tasks: tuple[str, ...] = ()          # task board lines
+    retire_tasks: tuple[str, ...] = ()
+
+
+def _str(v) -> str:
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _id_pair(item, field: str) -> Optional[tuple[str, str]]:
+    if not isinstance(item, dict):
+        return None
+    eid, value = _str(item.get("id")), _str(item.get(field))
+    return (eid, value) if eid and value else None
+
+
+def _task_line(item) -> str:
+    if not isinstance(item, dict):
+        return _str(item)
+    text, basis = _str(item.get("text")), _str(item.get("basis"))
+    return f"{text} (basis: {basis})" if text and basis else text
+
+
+def parse_watcher_reply(content: str, *, owns_digest: bool) -> Optional[WatcherReply]:
+    """The watcher LLM's JSON reply, minus wrong-typed or empty items (never coerced); limits apply after filtering."""
+    s, e = content.find("{"), content.rfind("}")
+    if s == -1 or e < s:
+        return None
+    try:
+        obj = json.loads(content[s: e + 1])
+    except ValueError:
+        return None
+
+    def _list(key: str) -> list:
+        v = obj.get(key)
+        return v if isinstance(v, list) else []
+
+    def _strs(key: str) -> list[str]:
+        return [t for t in map(_str, _list(key)) if t]
+
+    def _pairs(key: str, field: str) -> list[tuple[str, str]]:
+        return [p for p in (_id_pair(d, field) for d in _list(key)) if p]
+
+    add = [t for t in _strs("add") if not FLAG_RE.search(t) and not _is_flag_method(t)]
+    return WatcherReply(
+        add=tuple(add[:3]),
+        verify=tuple(_strs("verify")[:5]),
+        dispute=tuple(_pairs("dispute", "reason")[:3]),
+        supersede=tuple(_pairs("supersede", "new")[:3]),
+        digest=_str(obj.get("digest")) if owns_digest else "",
+        suggest_tasks=tuple([t for t in map(_task_line, _list("suggest_tasks")) if t][:2]),
+        retire_tasks=tuple(_strs("retire_tasks")[:3]),
+    )
+
+
+def _apply_watcher_reply(code: str, worker_id: str, reply: WatcherReply) -> dict[str, int]:
+    """One ledger or task-board call per item; the ledger rejects unknown ids, frozen kinds and forbidden moves."""
+    from . import ledger
+    from .taskboard import publish_task, retire_task
+    return {
+        "added": sum(ledger.add_fact(code, worker_id, t) is not None for t in reply.add),
+        "verified": sum(ledger.set_status(code, i, "verified", by=worker_id) for i in reply.verify),
+        "disputed": sum(ledger.set_status(code, i, "disputed", why, worker_id) for i, why in reply.dispute),
+        "superseded": sum(ledger.supersede(code, i, new, worker_id) is not None for i, new in reply.supersede),
+        "digest": int(bool(reply.digest) and ledger.set_digest(code, worker_id, reply.digest)),
+        "published": sum(publish_task(code, t) for t in reply.suggest_tasks),
+        "retired": sum(retire_task(code, r) for r in reply.retire_tasks),
+    }
 
 
 def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None:
     """LLM reviews recent activity and the ledger: appends entries, marks statuses, rewrites the solving-state digest, publishes directions.
 
-    The ledger is append-only (cruiser.ledger): entries are referenced by id, disputes/supersessions are recorded as statuses keeping the original text, with no fuzzy matching or deletion.
-    Also: extracts flag candidates from recent activity + the blackboard view and submits them programmatically as a fallback (the watcher can submit flags too).
+    The ledger (cruiser.ledger) is referenced by id and never deleted; disputes and supersessions are statuses that keep the original text.
+    Also submits flag candidates from the recent activity programmatically as a fallback (the watcher can submit flags too).
     """
     if not code or not activity.strip():
         return
     try:
         from . import ledger
-        reports_dir = os.path.join(os.getcwd(), "reports")
-        try:
-            with open(os.path.join(reports_dir, f"info_{code}.txt"), "r", encoding="utf-8") as f:
-                blackboard = f.read()
-        except Exception:
-            blackboard = ""
+        from .taskboard import list_claimed, list_tasks
         # watcher fallback submission: runs before curation, so it can submit even without a usable watcher LLM
-        _watcher_try_submit_flags(code, worker_id, activity, blackboard)
+        _watcher_try_submit_flags(code, worker_id, activity)
         llm = _get_watcher_llm()
         if llm is None:
             return
+        owns_digest = _owns_digest(worker_id)
         facts_text, results_text = _format_ledger_for_watcher(code)
-        from .taskboard import list_claimed, list_tasks, publish_task, retire_task
         pending_tasks = list_tasks(code)
         claimed_tasks = list_claimed(code)
         tasks_text = "\n".join(f"- [{t['id']}] {t['text']}" for t in pending_tasks) or "(empty)"
@@ -455,7 +538,10 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None
             .replace("{tasks}", tasks_text[-_WATCHER_TASKS_CHARS:])
             .replace("{claimed_tasks}", claimed_text[-_WATCHER_CLAIMED_CHARS:])
         )
+        if not owns_digest:
+            prompt += _WATCHER_NO_DIGEST
         # challenge description + hint (if fetched): lets the watcher use them to maintain the ledger and publish better-fitting exploration directions
+        reports_dir = os.path.join(os.getcwd(), "reports")
         context_header = ""
         for name, label, limit in (("desc", "Challenge description", _WATCHER_DESC_CHARS), ("hint", "Challenge hint", _WATCHER_HINT_CHARS)):
             try:
@@ -470,62 +556,16 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None
             HumanMessage(content=context_header + prompt),
         ])
         text = resp.content if isinstance(resp.content, str) else json.dumps(resp.content, ensure_ascii=False)
-        s, e = text.find("{"), text.rfind("}")
-        if s == -1 or e == -1:
+        reply = parse_watcher_reply(text, owns_digest=owns_digest)
+        if reply is None:
             return
-        obj = json.loads(text[s: e + 1])
-
-        def _items(key: str, n: int) -> list:
-            v = obj.get(key) or []
-            return v[:n] if isinstance(v, list) else []
-
-        known = {f["id"]: f for f in ledger.facts(code, include_superseded=True)}
-        editable = {i for i, f in known.items() if f["kind"] != "flag_method"}
-        n_add = n_ver = n_dis = n_sup = 0
-        for info in _items("add", 3):
-            info = str(info).strip()
-            if FLAG_RE.search(info):
-                continue  # an entry that is a flag-like literal carries no reusable fact
-            if info and not _is_flag_method(info) and ledger.add_fact(code, worker_id, info):
-                n_add += 1
-        for fid in _items("verify", 5):
-            if str(fid) in editable and ledger.set_status(code, str(fid), "verified", by=worker_id):
-                n_ver += 1
-        for d in _items("dispute", 3):
-            if isinstance(d, dict) and str(d.get("id")) in editable and str(d.get("reason") or "").strip():
-                if ledger.set_status(code, str(d["id"]), "disputed", redact(str(d["reason"])), worker_id):
-                    n_dis += 1
-        for u in _items("supersede", 3):
-            if isinstance(u, dict) and str(u.get("id")) in editable and str(u.get("new") or "").strip():
-                if ledger.supersede(code, str(u["id"]), redact(str(u["new"])), worker_id):
-                    n_sup += 1
-        new_digest = redact(str(obj.get("digest") or "").strip())
-        if new_digest:
-            ledger.set_digest(code, worker_id, new_digest)
-
-        published = retired = 0
-        for t in _items("suggest_tasks", 2):
-            t_text = str(t.get("text") if isinstance(t, dict) else t).strip()
-            basis = str(t.get("basis") or "").strip() if isinstance(t, dict) else ""
-            if not t_text:
-                continue
-            try:
-                if publish_task(code, f"{t_text} (basis: {basis})" if basis else t_text):
-                    published += 1
-            except Exception:
-                pass
-        for r in _items("retire_tasks", 3):
-            try:
-                if retire_task(code, str(r).strip()):
-                    retired += 1
-            except Exception:
-                pass
+        n = _apply_watcher_reply(code, worker_id, reply)
         try:
-            if published or retired:
-                print(f"[Watcher] session {worker_id} task board: published {published} / retired {retired}", flush=True)
-            if n_add or n_ver or n_dis or n_sup or new_digest:
-                print(f"[Watcher] session {worker_id} ledger: added {n_add} / verified {n_ver} / disputed {n_dis} / superseded {n_sup}"
-                      f"{' / digest updated' if new_digest else ''}", flush=True)
+            if n["published"] or n["retired"]:
+                print(f"[Watcher] session {worker_id} task board: published {n['published']} / retired {n['retired']}", flush=True)
+            if n["added"] or n["verified"] or n["disputed"] or n["superseded"] or n["digest"]:
+                print(f"[Watcher] session {worker_id} ledger: added {n['added']} / verified {n['verified']} / disputed {n['disputed']}"
+                      f" / superseded {n['superseded']}{' / digest updated' if n['digest'] else ''}", flush=True)
         except Exception:
             pass
     except Exception:
@@ -710,7 +750,7 @@ def _run_one_session(target: str, hint: str, code: str, worker_id: str, ws_dir: 
     eng_name = eng.NAME if eng is not None else "claude"
     # Explorer slots keep one engine conversation across sessions and stages; solvers always start fresh.
     slot = None if solver_task else worker_id
-    lead = slot == "1"
+    lead = slot == LEAD_SLOT
     prior = ledger.session_get(code, slot) if slot else None
     resume_id = prior.get("id") if prior and prior.get("engine") == eng_name else None
     if lead:
@@ -1050,7 +1090,7 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
     if shutil.which(engine_bin) is None:
         return json.dumps({"flag": None, "error": f"{engine_bin} CLI is not installed"}, ensure_ascii=False)
 
-    worker_id = os.environ.get("CRUISER_WORKER_ID", "single")
+    worker_id = os.environ.get("CRUISER_WORKER_ID", SINGLE_WORKER_ID)
     code = challenge_code or os.environ.get("CRUISER_CHALLENGE_CODE") or ""
     ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR") or ""
     if not ws_dir:
