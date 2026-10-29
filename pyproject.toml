@@ -17,7 +17,6 @@ dependencies = [
 	"sqlmap>=1.9.11",
 	"fenjing>=0.8.1",
 	"dirsearch>=0.4.3.post1",
-	"tsec-benchmark>=0.1.2",
 	"pwntools>=4.15.0",
 	"pyghidra>=3.1.0",
 	"pyyaml>=6.0",

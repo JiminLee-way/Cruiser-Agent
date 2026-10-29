@@ -4,7 +4,7 @@
 用法:
     python tools/submit_flag.py <challenge_code> <flag>
 
-输出与 cruiser.tools.submit_flag 工具一致，包含平台确认标记：
+输出与 cruiser.tools.submit_flag 工具一致，包含本地题目平台的确认标记：
 - 「提交flag正确」/「已经提交成功过了」表示平台确认成功
 - 其他输出表示失败或错误
 """

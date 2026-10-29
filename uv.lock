@@ -490,14 +490,14 @@ dependencies = [
     { name = "pwntools" },
     { name = "pydantic" },
     { name = "pyghidra" },
+    { name = "pyyaml" },
     { name = "requests" },
     { name = "setuptools" },
     { name = "sqlmap" },
-    { name = "tsec-benchmark" },
     { name = "typing-extensions" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "pytest" },
 ]
@@ -514,14 +514,15 @@ requires-dist = [
     { name = "pwntools", specifier = ">=4.15.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "pyghidra", specifier = ">=3.1.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "setuptools", specifier = ">=80.9.0" },
     { name = "sqlmap", specifier = ">=1.9.11" },
-    { name = "tsec-benchmark", specifier = ">=0.1.2" },
     { name = "typing-extensions", specifier = ">=4.9.0" },
 ]
-provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.2.0" }]
 
 [[package]]
 name = "cryptography"
@@ -1098,9 +1099,9 @@ source = { registry = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" }
 dependencies = [
     { name = "jsonpointer" },
 ]
-sdist = { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/42/78/18813351fe5d63acad16aec57f94ec2b70a09e53ca98145589e185423873/jsonpatch-1.33.tar.gz", hash = "sha256:9fcd4009c41e6d12348b4a0ff2563ba56a2923a7dfee731d004e212e1ee5030c" }
+sdist = { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/42/78/18813351fe5d63acad16aec57f94ec2b70a09e53ca98145589e185423873/jsonpatch-1.33.tar.gz", hash = "sha256:9fcd4009c41e6d12348b4a0ff2563ba56a2923a7dfee731d004e212e1ee5030c", size = 21699, upload-time = "2023-06-26T12:07:29.144Z" }
 wheels = [
-    { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/73/07/02e16ed01e04a374e644b575638ec7987ae846d25ad97bcc9945a3ee4b0e/jsonpatch-1.33-py2.py3-none-any.whl", hash = "sha256:0ae28c0cd062bbd8b8ecc26d7d164fbbea9652a1a3693f3b956c1eae5145dade" },
+    { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/73/07/02e16ed01e04a374e644b575638ec7987ae846d25ad97bcc9945a3ee4b0e/jsonpatch-1.33-py2.py3-none-any.whl", hash = "sha256:0ae28c0cd062bbd8b8ecc26d7d164fbbea9652a1a3693f3b956c1eae5145dade", size = 12898, upload-time = "2023-06-16T21:01:28.466Z" },
 ]
 
 [[package]]
@@ -2825,18 +2826,6 @@ source = { registry = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" }
 sdist = { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/53/a3/1585216310e344e8102c22482f6060c7a6ea0322b63e026372e6dcefcfd6/truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301", size = 26169, upload-time = "2025-08-12T18:49:02.73Z" }
 wheels = [
     { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/19/97/56608b2249fe206a67cd573bc93cd9896e1efb9e98bce9c163bcdc704b88/truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981", size = 18660, upload-time = "2025-08-12T18:49:01.46Z" },
-]
-
-[[package]]
-name = "tsec-benchmark"
-version = "0.1.2"
-source = { registry = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" }
-dependencies = [
-    { name = "httpx" },
-]
-sdist = { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/88/8f/a1fe7dc7920112083c0e46b8cc39632a0341f32609f40985c50bc6f3a18f/tsec_benchmark-0.1.2.tar.gz", hash = "sha256:ee531d8c33c50de372787ef93042f1c4bb6ce2d6222ced5f056c570ca19acf7e", size = 28313, upload-time = "2026-07-05T14:40:35.593Z" }
-wheels = [
-    { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/e6/bc/3266dcc0fba98ec70381c61cf8c9b4ff63cc1666d024fb0c63eff5bfe0c0/tsec_benchmark-0.1.2-py3-none-any.whl", hash = "sha256:eb2aca22f0f09e975d7dda2e8202be7e227d8b00439293c3e103d85e3c6d8616", size = 16598, upload-time = "2026-07-05T14:40:33.94Z" },
 ]
 
 [[package]]

@@ -53,7 +53,7 @@
       .map(([k, v]) => `<span class="vital">${k}<b>${v}</b></span>`)
       .join("");
     $("pulse").dataset.alive = snap.alive ? "1" : "0";
-    $("pulse").textContent = snap.alive ? (snap.local ? "调度中 · 本地" : "调度中") : "无调度心跳";
+    $("pulse").textContent = snap.alive ? "调度中" : "无调度心跳";
     $("clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   }
 

@@ -1,8 +1,6 @@
 from cruiser.claude_agent import run_auto_scan
 import argparse
 import atexit
-import fcntl
-import glob
 import json
 import os
 import subprocess
@@ -12,125 +10,10 @@ import time
 import re
 import signal
 import uuid
-import random
-import requests
-from cruiser.tools import get_benchmark_client
+from cruiser.challenges import CHALLENGES_ENV, PlatformError, get_platform, target_host_port
 from cruiser.taskboard import claim_task
 from cruiser import runtime
 from cruiser.dashboard import start_dashboard
-from tsec_benchmark import InvalidState, TSecError
-
-
-def _fix_pushed_routes(log_path: str) -> None:
-    """从 openvpn 日志解析服务端 PUSH_REPLY 推送的路由，经 tun0 逐条修复。
-
-    本环境 openvpn 2.5 的 sitnl 对部分推送路由添加失败（Network is unreachable），
-    统一改用 'ip route replace <net>/<mask> dev tun0' 直连设备方式兜底。
-    """
-    try:
-        with open(log_path, "r", errors="ignore") as f:
-            content = f.read()
-        replies = re.findall(r"PUSH_REPLY[^\n]*", content)
-        if not replies:
-            return
-        for network, netmask in re.findall(r"route (\d+\.\d+\.\d+\.\d+) (\d+\.\d+\.\d+\.\d+)", replies[-1]):
-            subprocess.run(["ip", "route", "replace", f"{network}/{netmask}", "dev", "tun0"], capture_output=True)
-    except Exception:
-        pass
-
-
-def close_all_containers() -> None:
-    """启动时关闭所有已开启的容器，确保从干净状态开始。
-
-    清理异常退出/崩溃残留的容器（包括已完成题目的——它们不会出现在
-    未解列表里，运行中的僵尸回收器覆盖不到）。仅在主进程调用。
-    """
-    try:
-        client = get_benchmark_client()
-        running = [ch for ch in client.list_challenges() if ch.container_status != "stopped"]
-    except Exception as e:
-        try:
-            print(f"[Startup] 获取容器状态失败: {e}", flush=True)
-        except Exception:
-            pass
-        return
-    for ch in running:
-        try:
-            client.close_challenge(ch.unique_code)
-            print(f"[Startup] 关闭遗留容器 {ch.unique_code}", flush=True)
-        except Exception:
-            pass
-    if running:
-        try:
-            print(f"[Startup] 已清理 {len(running)} 个遗留容器", flush=True)
-        except Exception:
-            pass
-
-
-def ensure_vpn_connected() -> None:
-    """确保靶场 VPN 已连接；不通时自动用 vpn/ 下最新的 ovpn 配置连接并修复路由。
-
-    tsec-benchmark SDK 只检测 VPN 连通性（check_vpn），不负责建立连接。
-    本函数仅在主进程启动时调用（spawn 的 worker 子进程带 CRUISER_WORKER_ID，会跳过），
-    通过文件锁防止并发重复连接。
-
-    当 vpn/ 目录为空（无 *.ovpn 配置）时，默认不连接 VPN，直接答题
-    （适用于平台可直连、无需靶场 VPN 的环境）。
-    """
-    root = os.path.dirname(os.path.abspath(__file__))
-    configs = sorted(glob.glob(os.path.join(root, "vpn", "*.ovpn")), key=os.path.getmtime)
-    if not configs:
-        print("[VPN] vpn/ 目录为空，跳过 VPN 连接，直接答题", flush=True)
-        return
-    try:
-        get_benchmark_client()  # 内部含 VPN 预检，成功即已连接
-        return
-    except Exception:
-        pass
-    lock_fd = None
-    try:
-        lock_fd = os.open("/tmp/cruiser_vpn.lock", os.O_CREAT | os.O_RDWR)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        # 拿锁后复核（可能已被其他进程连上）
-        try:
-            get_benchmark_client()
-            return
-        except Exception:
-            pass
-        cfg = configs[-1]
-        print(f"[VPN] 未连接，自动连接: {os.path.basename(cfg)}", flush=True)
-        subprocess.run(["pkill", "-x", "openvpn"], capture_output=True)
-        time.sleep(1)
-        log_path = "/tmp/openvpn.log"
-        try:
-            os.remove(log_path)
-        except OSError:
-            pass
-        subprocess.Popen(["openvpn", "--config", cfg, "--daemon", "--log", log_path])
-        # 等待隧道初始化完成（最多 40 秒）
-        for _ in range(20):
-            time.sleep(2)
-            try:
-                with open(log_path, "r", errors="ignore") as f:
-                    if "Initialization Sequence Completed" in f.read():
-                        break
-            except OSError:
-                pass
-        _fix_pushed_routes(log_path)
-    except Exception as e:
-        print(f"[VPN] 自动连接异常: {e}", flush=True)
-    finally:
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-            except Exception:
-                pass
-    try:
-        get_benchmark_client()
-        print("[VPN] 自动连接成功", flush=True)
-    except Exception as e:
-        print(f"[VPN] 自动连接后仍不通: {e}，请检查 vpn/ 配置", flush=True)
 
 
 def main():
@@ -157,15 +40,7 @@ def main():
         default=None,
         help="（内部）solver 专用：本次仅聚焦执行这一条探索方向，不做整题探索",
     )
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="本地测试模式：大模型端点改用原始官方 https 域名（默认走比赛内网 .tsecbench.gw 域名）",
-    )
     args = parser.parse_args()
-    # 本地测试开关：置环境变量供 cruiser.llm 端点解析读取；子进程 env=os.environ.copy() 会继承。
-    if args.local:
-        os.environ["CRUISER_LOCAL"] = "1"
     # 将超时策略注入环境，供当前/子会话使用
     if args.default_timeout and args.default_timeout > 0:
         os.environ["CRUISER_DEFAULT_TIMEOUT"] = str(args.default_timeout)
@@ -184,8 +59,14 @@ def main():
     if worker_models:
         print(f"[Main] worker 模型搭配：{worker_models}（共 {sessions} 个 worker）", flush=True)
 
-    # 主进程启动时确保靶场 VPN 已连接（spawn 的 worker 子进程会跳过）
-    if os.environ.get("CRUISER_WORKER_ID") is None:
+    # 本地题目平台：题目定义 YAML（CRUISER_CHALLENGES，默认项目根目录 challenges.yaml）+
+    # reports/_platform_state.json 进度。把定义文件固定为绝对路径写回环境变量，
+    # 保证 worker 与 Agent 在工作空间里调用的 submit_flag.py 读到同一份定义。
+    platform = get_platform()
+    os.environ[CHALLENGES_ENV] = platform.challenges_file
+
+    # 主进程启动自检（spawn 的 worker/solver 子进程带 CRUISER_WORKER_ID，会跳过）
+    if not _is_worker_proc:
         from cruiser.llm import get_deepseek_api_key, get_kimi_api_key, get_glm_api_key
         if not get_deepseek_api_key() and not get_kimi_api_key() and not get_glm_api_key() and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
             print(
@@ -193,64 +74,54 @@ def main():
                 "claude 解题引擎与 watcher 将无法认证。请在项目根目录 .env 中配置。",
                 flush=True,
             )
-        ensure_vpn_connected()
-        # 关闭所有遗留容器，从干净状态开始
-        close_all_containers()
+        try:
+            defined = platform.challenges()
+        except PlatformError as e:
+            print(f"[Main] 题目定义加载失败: {e}", flush=True)
+            sys.exit(2)
+        print(f"[Main] 已加载 {len(defined)} 道题目: {platform.challenges_file}", flush=True)
+        # 清理上次异常退出遗留的 cruiser_* compose 项目，从干净状态开始
+        for name in platform.down_leftovers():
+            print(f"[Startup] 已关闭遗留靶场 {name}", flush=True)
         start_dashboard()
 
     DIFF_RANK = {"easy": 0, "medium": 1, "hard": 2}
 
     def fetch_all_unsolved() -> dict[str, dict] | None:
-        """Return a map: code -> {challenge_code, target, difficulty, ...} for all unsolved challenges.
-        Returns None on fetch/parse errors (do NOT update queues in that case).
-        Returns {} when fetched successfully but no unsolved challenges are available.
-
-        注意：SDK 的 list_challenges 仅当容器 available 时才带 container_addr；
-        容器 stopped 时 target 为空字符串，由 ensure_challenge_started 在扫描前启动。
+        """Return a map: code -> {challenge_code, difficulty, ...} for all unsolved challenges.
+        Returns None on load/parse errors (do NOT update queues in that case).
+        Returns {} when every defined challenge is solved.
         """
         try:
-            challenges = get_benchmark_client().list_challenges()
+            statuses = platform.list_challenges()
         except Exception as e:
             try:
                 print(f"[Fetcher] 获取题目失败: {e}", flush=True)
             except Exception:
                 pass
             return None
-        try:
-            result: dict[str, dict] = {}
-            for ch in challenges:
-                if ch.is_completed:
-                    continue
-                urls = [f"http://{addr}" for addr in (ch.container_addr or []) if addr]
-                result[ch.unique_code] = {
-                    "challenge_code": ch.unique_code,
-                    "target": ", ".join(urls),
-                    "difficulty": (ch.difficulty or "").lower(),
-                    "description": getattr(ch, "description", "") or "",
-                    "level": getattr(ch, "level", "") or "",
-                    "total_score": getattr(ch, "total_score", 0),
-                    "container_status": ch.container_status or "",
-                    "flag_count": ch.flag_count,
-                    "correct_flag_count": ch.correct_flag_count,
-                }
-            return result
-        except Exception as e:
-            try:
-                print(f"[Fetcher] 解析题目失败: {e}", flush=True)
-            except Exception:
-                pass
-            return None
+        result: dict[str, dict] = {}
+        for st in statuses:
+            if st.completed:
+                continue
+            ch = st.challenge
+            result[ch.code] = {
+                "challenge_code": ch.code,
+                "difficulty": ch.difficulty,
+                "description": ch.description,
+                "flag_count": st.total,
+                "correct_flag_count": st.correct,
+            }
+        return result
 
-    def ensure_challenge_started(code: str, timeout_s: float = 300.0) -> list[str]:
-        """确保题目容器已启动，返回直连地址数组（IP:端口）；失败/超时返回 []。
+    def ensure_challenge_started(code: str) -> list[str]:
+        """启动题目靶场，返回目标 URL 列表；启动失败返回 []。
 
-        start_challenge 后容器可能仍处于 pending，需轮询 list_challenges
-        直至 container_status == "available" 且拿到 container_addr。
-        平台限制活跃容器数量（max active），名额满时快速失败由调度器稍后重试。
+        静态目标（target）直接返回地址；compose 题目执行 docker compose up -d。
         """
         if not code:
             return []
-        # 就绪判定：拿到地址后主动探测目标端口是否真正可连（容器 available 不等于
+        # 就绪判定：拿到地址后主动探测目标端口是否真正可连（容器已启动不等于
         # 内部服务已监听）。任一地址连通即立即返回；最多等待 CRUISER_CONTAINER_WARMUP
         # 秒（默认 60），到点仍未连通也照常返回地址，交给 LLM 去解题，避免卡死。
         try:
@@ -258,13 +129,13 @@ def main():
         except Exception:
             max_wait_s = 60.0
 
-        def _addr_reachable(addr: str, conn_timeout: float = 3.0) -> bool:
+        def _addr_reachable(url: str, conn_timeout: float = 3.0) -> bool:
             import socket
+            hp = target_host_port(url)
+            if hp is None:
+                return False
             try:
-                host, _, port = str(addr).rpartition(":")
-                if not host or not port:
-                    return False
-                with socket.create_connection((host, int(port)), timeout=conn_timeout):
+                with socket.create_connection(hp, timeout=conn_timeout):
                     return True
             except Exception:
                 return False
@@ -273,7 +144,7 @@ def main():
             if not addrs or max_wait_s <= 0:
                 return addrs
             try:
-                print(f"[Container] {code} 容器就绪，探测目标可达性（最多 {max_wait_s:.0f}s）…", flush=True)
+                print(f"[Container] {code} 靶场已启动，探测目标可达性（最多 {max_wait_s:.0f}s）…", flush=True)
             except Exception:
                 pass
             deadline = time.time() + max_wait_s
@@ -292,130 +163,36 @@ def main():
             return addrs
 
         try:
-            client = get_benchmark_client()
+            return _ready(platform.start(code))
         except Exception as e:
-            try:
-                print(f"[Container] SDK 初始化失败: {e}", flush=True)
-            except Exception:
-                pass
-            return []
-        try:
-            started = client.start_challenge(code)
-            if started.container_addr:
-                return _ready(list(started.container_addr))
-        except InvalidState as e:
-            if "max active" in str(e).lower():
-                # 活跃容器名额已满：快速失败 + 15 秒冷却（覆盖服务端拆除窗口）
-                try:
-                    start_cooldowns[code] = time.time() + 15
-                except Exception:
-                    pass
-                try:
-                    print(f"[Container] {code} 启动被拒：活跃名额已满，15 秒后重试", flush=True)
-                except Exception:
-                    pass
-                return []
-            # 其他状态非法（如已启动/启动中）：走轮询拿地址
-        except TSecError as e:
             try:
                 print(f"[Container] 启动 {code} 失败: {e}", flush=True)
             except Exception:
                 pass
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            try:
-                for ch in client.list_challenges():
-                    if ch.unique_code == code:
-                        if ch.container_status == "available" and ch.container_addr:
-                            return _ready(list(ch.container_addr))
-                        break
-            except TSecError:
-                pass
-            time.sleep(2)
-        try:
-            print(f"[Container] 等待 {code} 容器就绪超时", flush=True)
-        except Exception:
-            pass
-        return []
-
-    def _container_stopped(code: str):
-        """用 SDK 查该题容器是否确已 stopped。
-        返回 True=已停 / False=仍在 / None=查询失败(状态未知)。
-        用 list_challenges 全量列表（含已解/已移除题），故能识别脱离未解列表但容器仍在的僵尸。"""
-        try:
-            for ch in get_benchmark_client().list_challenges():
-                if ch.unique_code == code:
-                    return (ch.container_status or "stopped") == "stopped"
-            return True  # 平台列表里已无此题，视作无容器
-        except Exception:
-            return None
+            return []
 
     def close_challenge_quiet(code: str) -> None:
-        """关闭题目容器并用 SDK 校验是否真的关了；未确认停止则继续重试，
-        直到确认已停或用尽次数（平台拆除为异步，故每次关闭后等待再校验）。
-        次数用尽仍未确认时打 WARN，交由 reaper 周期性兜底，避免线程无限阻塞。"""
+        """关闭题目靶场（compose 题目 docker compose down -v；静态目标为空操作），异常只打印。"""
         if not code:
             return
         try:
-            max_attempts = max(1, int(os.environ.get("CRUISER_CLOSE_MAX_ATTEMPTS", "6") or "6"))
-        except Exception:
-            max_attempts = 6
-        try:
-            verify_wait = float(os.environ.get("CRUISER_CLOSE_VERIFY_WAIT", "10") or "10")
-        except Exception:
-            verify_wait = 10.0
-        for attempt in range(1, max_attempts + 1):
-            # 关闭调用本身异常也不放弃：容器可能正在关/状态刚变更，继续校验为准
+            platform.close(code)
+        except Exception as e:
             try:
-                get_benchmark_client().close_challenge(code)
+                print(f"[Container] [WARN] 关闭 {code} 失败: {e}", flush=True)
             except Exception:
                 pass
-            # 平台异步拆除，等待后再核实
-            try:
-                time.sleep(verify_wait)
-            except Exception:
-                pass
-            stopped = _container_stopped(code)
-            if stopped is True:
-                try:
-                    print(f"[Container] 已确认关闭 {code} 容器（第 {attempt}/{max_attempts} 次）", flush=True)
-                except Exception:
-                    pass
-                return
-            try:
-                reason = "状态查询失败" if stopped is None else "仍未停止"
-                print(f"[Container] {code} 关闭后{reason}，重试 {attempt}/{max_attempts}", flush=True)
-            except Exception:
-                pass
-        try:
-            print(f"[Container] [WARN] {code} 关闭在 {max_attempts} 次尝试后仍未确认停止，交由 reaper 兜底", flush=True)
-        except Exception:
-            pass
 
     def fetch_hint_text(code: str) -> str:
-        """通过 SDK 获取题目提示（注意：查看提示会按比例扣减该题得分）。"""
-        base_delay = 0.5
-        max_attempts = 5
-        for attempt in range(max_attempts):
+        """读取题目提示（题目定义里的 hint；无提示返回空串）。"""
+        try:
+            return (platform.hint(code) or "").strip()
+        except Exception as e:
             try:
-                res = get_benchmark_client().get_hint(code)
-                hint_text = (res.hint or "").strip()
-                # hint 为 None 表示该题无提示，直接返回空，不重试
-                return hint_text
-            except Exception as e:
-                try:
-                    print(f"[HintFetcher] 获取提示异常: {e}", flush=True)
-                except Exception:
-                    pass
-            if attempt < max_attempts - 1:
-                # 随机退避：指数回退 + 抖动
-                sleep_seconds = min(8.0, base_delay * (2 ** attempt)) * (0.5 + random.random())
-                try:
-                    print(f"[HintFetcher] 第 {attempt + 1}/{max_attempts} 次失败，随机退避 {sleep_seconds:.2f}s 后重试…", flush=True)
-                except Exception:
-                    pass
-                time.sleep(sleep_seconds)
-        return ""
+                print(f"[HintFetcher] 获取提示异常: {e}", flush=True)
+            except Exception:
+                pass
+            return ""
 
     # 单会话：使用中心题目获取器获取题目并下发给会话；
     # 若提供了 --challenge-code，则直接按下发的题目运行一次并返回
@@ -425,12 +202,11 @@ def main():
             target = args.target or ""
             if code:
                 os.environ["CRUISER_CHALLENGE_CODE"] = code
-            # 未显式指定 target 时，通过 SDK 启动题目容器获取靶场直连地址
+            # 未显式指定 target 时，由本地平台启动靶场获取目标地址
             if not target:
-                addrs = ensure_challenge_started(code)
-                target = ", ".join(f"http://{a}" for a in addrs)
+                target = ", ".join(ensure_challenge_started(code))
             if not target:
-                print(json.dumps({"flag": None, "error": f"题目 {code} 容器未就绪"}, ensure_ascii=False))
+                print(json.dumps({"flag": None, "error": f"题目 {code} 靶场未就绪"}, ensure_ascii=False))
                 return
             # 为单会话创建独立工作空间
             try:
@@ -472,22 +248,17 @@ def main():
                 time.sleep(5)
                 continue
             if not chal:
-                try:
-                    print("[Fetcher] 暂无可用题目，10 秒后重试…", flush=True)
-                except Exception:
-                    pass
-                time.sleep(10)
-                continue
+                print("[Fetcher] 全部题目已解出，退出", flush=True)
+                return
             code = chal.get("challenge_code") or ""
-            target = chal.get("target") or (args.target or "")
+            target = args.target or ""
             if code:
                 os.environ["CRUISER_CHALLENGE_CODE"] = code
-            # 容器未启动时（target 为空），通过 SDK 启动并等待就绪
+            # 未显式指定 target 时，由本地平台启动靶场并等待就绪
             if not target and code:
-                addrs = ensure_challenge_started(code)
-                target = ", ".join(f"http://{a}" for a in addrs)
+                target = ", ".join(ensure_challenge_started(code))
             if not target:
-                print(f"[Fetcher] {code} 容器未就绪，5 秒后重试…", flush=True)
+                print(f"[Fetcher] {code} 靶场未就绪，5 秒后重试…", flush=True)
                 time.sleep(5)
                 continue
             # 为单会话循环创建独立工作空间
@@ -502,7 +273,7 @@ def main():
             try:
                 result = run_auto_scan(target, max_steps=args.max_steps, quiet=args.quiet, hint=args.hint, challenge_code=code or None)
             finally:
-                # 成功或失败后关闭容器，释放活跃名额
+                # 成功或失败后关闭靶场
                 close_challenge_quiet(code)
             try:
                 obj = json.loads(result)
@@ -517,7 +288,7 @@ def main():
             continue
 
     # 多会话并发：启动子进程并行扫描，实时将每个会话的输出打印到标准输出；
-    # 收题只认 SDK 轮询（is_completed / flag 进度），不解析 worker 日志。
+    # 收题只认本地平台的 flag 进度（reports/_platform_state.json），不解析 worker 日志。
     num = max(1, int(sessions))
 
     def spawn_worker(idx: int, target: str, code: str | None, hint_text: str | None, env_overrides: dict | None = None, model: str | None = None):
@@ -621,7 +392,7 @@ def main():
         if args.quiet:
             cmd.append("--quiet")
         env = os.environ.copy()
-        env["CRUISER_WORKER_ID"] = f"solver{sid}"   # 视作 worker 子进程：跳过 VPN/容器管理，且不解析 worker_models
+        env["CRUISER_WORKER_ID"] = f"solver{sid}"   # 视作 worker 子进程：跳过启动自检，且不解析 worker_models
         env["CRUISER_SESSIONS"] = str(num)
         env["CRUISER_CHALLENGE_CODE"] = code
         env.pop("CRUISER_WORKER_MODELS", None)
@@ -658,43 +429,27 @@ def main():
     # -------- 新流程：预处理(50,不看提示) -> 一级(100,不看提示) -> 二级(150,不看提示) -> 三级(200,四级起看提示) --------
     count_re = re.compile(r"\[COUNT\]\s*(\d+)")
 
-    def _sdk_mark_completed(groups: dict) -> None:
-        """以平台 list_challenges 为准判定是否解出，不解析 worker stdout。"""
+    def _mark_completed(groups: dict) -> None:
+        """以本地平台的 flag 进度为准判定是否解出，不解析 worker stdout。"""
         try:
-            challenges = get_benchmark_client().list_challenges()
+            by_code = {st.code: st for st in platform.list_challenges()}
         except Exception:
             return
-        by_code = {ch.unique_code: ch for ch in challenges}
         for code, grp in groups.items():
             if grp.get("winner") is not None:
                 continue
-            ch = by_code.get(code)
-            if ch is None:
+            st = by_code.get(code)
+            if st is None:
                 continue
-            if getattr(ch, "is_completed", False):
-                grp["winner"] = f"[SDK] {code} is_completed"
-                try:
-                    runtime.stage_winner(code, grp["winner"])
-                except Exception:
-                    pass
-                try:
-                    print(f"[{code}] [STAGE] 平台确认本题已完成，结束本轮", flush=True)
-                except Exception:
-                    pass
-                continue
-            try:
-                total = int(getattr(ch, "flag_count", 0) or 0)
-                correct = int(getattr(ch, "correct_flag_count", 0) or 0)
-            except Exception:
-                continue
+            total, correct = st.total, st.correct
             grp["flag_total"] = max(grp.get("flag_total", 0), total)
             grp["flag_correct"] = max(grp.get("flag_correct", 0), correct)
             try:
                 runtime.stage_flags(code, grp["flag_correct"], grp["flag_total"])
             except Exception:
                 pass
-            if total >= 1 and correct >= total:
-                grp["winner"] = f"[SDK] {code} flag {correct}/{total}"
+            if st.completed:
+                grp["winner"] = f"[platform] {code} flag {correct}/{total}"
                 try:
                     runtime.stage_winner(code, grp["winner"])
                 except Exception:
@@ -706,28 +461,21 @@ def main():
 
     def run_parallel_stage(codes: list[str], items: dict[str, dict], step_threshold: float, prefetch_hint: bool, disable_hint: bool, kill_map: dict[str, threading.Event] | None = None) -> tuple[set[str], set[str]]:
         """并行对多个题目运行一轮，达到阈值或出 flag 即停止每个题目的会话组。
-        每题开扫前通过 SDK 启动容器，本轮结束后统一关闭容器释放名额。
+        每题开扫前由本地平台启动靶场，本轮结束后统一关闭。
         返回 (flagged, remaining, skipped)：
         - flagged: 出 flag 的题
         - remaining: 实际执行了但未解出的题（晋级下一级）
-        - skipped: 容器未就绪、本轮根本没执行的题（不算尝试过，留在原层级重试）"""
+        - skipped: 靶场未就绪、本轮根本没执行的题（不算尝试过，留在原层级重试）"""
         groups = {}
         started_codes: list[str] = []
         for code in codes:
-            # 优先复用列表中已有地址（容器 available 时），否则启动容器并等待就绪
-            target = (items.get(code) or {}).get("target") or ""
-            if target:
-                # 复用平台侧已在运行的容器（多为异常退出残留）：
-                # 同样记入关闭清单，本轮结束统一关闭，避免容器泄漏后本地丢失跟踪
+            addrs = ensure_challenge_started(code)
+            if addrs:
                 started_codes.append(code)
-            else:
-                addrs = ensure_challenge_started(code)
-                if addrs:
-                    started_codes.append(code)
-                target = ", ".join(f"http://{a}" for a in addrs)
+            target = ", ".join(addrs)
             if not target:
                 try:
-                    print(f"[Stage] {code} 容器未就绪，本轮跳过", flush=True)
+                    print(f"[Stage] {code} 靶场未就绪，本轮跳过", flush=True)
                 except Exception:
                     pass
                 continue
@@ -948,12 +696,12 @@ def main():
             grp["solver_threads"].append(st)
 
         # 等待所有题目完成本轮（阈值或平台确认解出）
-        last_sdk_poll = 0.0
+        last_poll = 0.0
         while True:
             now = time.time()
-            if now - last_sdk_poll >= 2.0:
-                _sdk_mark_completed(groups)
-                last_sdk_poll = now
+            if now - last_poll >= 2.0:
+                _mark_completed(groups)
+                last_poll = now
             all_done = True
             for code, grp in groups.items():
                 if grp["kill_evt"].is_set():
@@ -979,6 +727,8 @@ def main():
                 time.sleep(0.2)
             except Exception:
                 pass
+        # 收尾再对账一次：组因外部强杀/进程退出而结束时，避免漏记刚交齐的题
+        _mark_completed(groups)
 
         # 停掉所有进程（整组杀进程：先发 SIGTERM 到进程组，超时再 SIGKILL）
         # 先让每题的 solver 驱动收尾（它会清杀自己派生的 solver 子进程），再等其退出
@@ -1021,7 +771,7 @@ def main():
                 with worker_procs_lock:
                     worker_procs.discard(entry["proc"])
 
-        # 关闭本轮启动的题目容器，释放靶场资源与活跃名额
+        # 关闭本轮启动的题目靶场
         for code in started_codes:
             close_challenge_quiet(code)
 
@@ -1031,7 +781,7 @@ def main():
         for code in codes:
             grp = groups.get(code)
             if grp is None:
-                # 容器未就绪，本轮未实际执行
+                # 靶场未就绪，本轮未实际执行
                 skipped.add(code)
             elif grp["winner"] is not None:
                 flagged.add(code)
@@ -1056,25 +806,14 @@ def main():
     tier2_threads: dict[str, threading.Thread] = {}
     tier3_threads: dict[str, threading.Thread] = {}
 
-    # 平台活跃容器名额上限（实测为 3）：同时在跑的题目数不超过该值，
-    # 可用 CRUISER_MAX_ACTIVE 覆盖。超过上限的启动请求会被平台拒绝。
+    # 同时在跑的题目数上限（默认 3，CRUISER_MAX_ACTIVE 覆盖）：
+    # 每题一组 worker + 一个靶场，限制并发以控制本机资源与 LLM 配额消耗。
     MAX_INFLIGHT = max(1, int(os.environ.get("CRUISER_MAX_ACTIVE", "3") or "3"))
-
-    # 启动冷却：被平台以 max active 拒绝后，该题在此时间戳前不再尝试启动。
-    # 覆盖容器关闭的服务端异步拆除窗口（close 后平台仍短暂计数）。
-    start_cooldowns: dict[str, float] = {}
-    zombie_closing: set[str] = set()  # 正在回收中的僵尸容器
-
-    def _in_cooldown(code: str) -> bool:
-        return time.time() < start_cooldowns.get(code, 0.0)
 
     def _inflight_count() -> int:
         return len(preproc_threads) + len(tier1_threads) + len(tier2_threads) + len(tier3_threads)
 
-    def _inflight_codes() -> set[str]:
-        return set(preproc_threads) | set(tier1_threads) | set(tier2_threads) | set(tier3_threads)
-
-    # -------- 退出清理：Ctrl+C / SIGTERM 时整组杀掉全部 worker 并关闭活跃容器 --------
+    # -------- 退出清理：Ctrl+C / SIGTERM 时整组杀掉全部 worker 并关闭在跑靶场 --------
     # worker 以 start_new_session 启动（独立进程组，收不到 Ctrl+C 的 SIGINT），
     # 因此必须由父进程在退出时逐个 killpg 回收，否则会全部漏网成孤儿进程。
     worker_procs: set[subprocess.Popen] = set()
@@ -1099,36 +838,13 @@ def main():
                     pass
         if procs:
             print(f"[Main] 已清理 {len(procs)} 个 worker 进程组", flush=True)
-        # 2) 关闭所有活跃容器，释放平台名额。
-        #    注意：此处不能用 SDK——atexit 阶段 concurrent.futures 已全局关停，
-        #    httpx/asyncio 无法调度新任务（RuntimeError: cannot schedule new futures）。
-        #    改用 requests 直连 REST 端点（端点格式与 SDK 一致）；
-        #    close 在服务端较慢，读超时也视为已发送（服务端异步完成）。
+        # 2) 关闭所有在跑的 compose 靶场（cruiser_* 项目）
         try:
-            base_url = os.environ.get("BENCHMARK_BASE_URL", "").rstrip("/")
-            token = os.environ.get("BENCHMARK_TOKEN", "")
-            if base_url and token:
-                headers = {"BENCHMARK_TOKEN": token}
-                resp = requests.get(f"{base_url}/openapi/v1/challenges", headers=headers, timeout=10)
-                for ch in resp.json():
-                    if ch.get("container_status", "stopped") == "stopped":
-                        continue
-                    code = ch.get("unique_code", "")
-                    if not code:
-                        continue
-                    try:
-                        requests.post(
-                            f"{base_url}/openapi/v1/challenges/close",
-                            params={"unique_code": code},
-                            headers=headers,
-                            timeout=20,
-                        )
-                        print(f"[Main] 已关闭 {code} 容器", flush=True)
-                    except Exception:
-                        print(f"[Main] 关闭 {code} 请求已发送（响应超时，服务端将异步完成）", flush=True)
+            for name in platform.down_leftovers():
+                print(f"[Main] 已关闭靶场 {name}", flush=True)
         except Exception as e:
             try:
-                print(f"[Main] 关闭容器时异常: {type(e).__name__}: {e}", flush=True)
+                print(f"[Main] 关闭靶场时异常: {type(e).__name__}: {e}", flush=True)
             except Exception:
                 pass
 
@@ -1157,11 +873,11 @@ def main():
             tier1 &= present
             tier2 = [c for c in tier2 if c in present]
             tier3 = [c for c in tier3 if c in present]
-            # 对于已不在平台但仍在运行的题，触发强杀（包含平台列表为空的场景）
+            # 对于已解出 / 已从题目定义移除但仍在运行的题，触发强杀（包含列表为空的场景）
             for code in list(kill_flags.keys()):
                 if code not in present:
                     try:
-                        print(f"[Fetcher] 题目 {code} 已从平台移除，强制停止其会话…", flush=True)
+                        print(f"[Fetcher] 题目 {code} 已解出或已移除，强制停止其会话…", flush=True)
                     except Exception:
                         pass
                     try:
@@ -1169,31 +885,17 @@ def main():
                     except Exception:
                         pass
         if not present:
-            print("[Fetcher] 暂无可用题目，10 秒后重试…", flush=True)
-            time.sleep(10)
+            # 全部题目已解出：等在飞的会话组收尾后退出（atexit 负责清理）
+            with stage_lock:
+                inflight_now = _inflight_count()
+            if inflight_now == 0:
+                print("[Fetcher] 全部题目已解出，退出", flush=True)
+                return
+            time.sleep(1.0)
             continue
 
-        # 僵尸容器回收：平台侧仍在运行但本地无在飞线程的容器（异常退出残留/拆除延迟），
-        # 后台线程逐个关闭，避免挤占活跃名额导致误拒新启动
-        with stage_lock:
-            zombies = [
-                c for c in present
-                if (items[c].get("container_status") or "stopped") != "stopped"
-                and c not in _inflight_codes()
-                and c not in zombie_closing
-            ]
-        for code in zombies:
-            zombie_closing.add(code)
-            def _reap(cc: str):
-                try:
-                    print(f"[Reaper] 回收僵尸容器 {cc}", flush=True)
-                    close_challenge_quiet(cc)
-                finally:
-                    zombie_closing.discard(cc)
-            threading.Thread(target=_reap, args=(code,), daemon=True).start()
-
         # 启动预处理（动态、不看提示、每题独立执行器，50步）
-        new_codes = [c for c in present if c not in preprocessed and not _in_cooldown(c)]
+        new_codes = [c for c in present if c not in preprocessed]
         for code in new_codes:
             if code in preproc_threads:
                 continue
@@ -1221,7 +923,7 @@ def main():
 
         # 启动一级（动态并行、不看提示、每题独立执行器，100步）
         with stage_lock:
-            tier1_ready = sorted([c for c in tier1 if c not in tier1_threads and not _in_cooldown(c)], key=lambda c: _rank_code(c, items))
+            tier1_ready = sorted([c for c in tier1 if c not in tier1_threads], key=lambda c: _rank_code(c, items))
         for code in tier1_ready:
             if _inflight_count() >= MAX_INFLIGHT:
                 break
@@ -1249,7 +951,7 @@ def main():
 
         # 启动二级（并行、不看提示、每题独立执行器，150步）
         with stage_lock:
-            tier2_ready = [c for c in tier2 if c not in tier2_threads and not _in_cooldown(c)]
+            tier2_ready = [c for c in tier2 if c not in tier2_threads]
         for code in tier2_ready:
             if _inflight_count() >= MAX_INFLIGHT:
                 break
@@ -1283,7 +985,7 @@ def main():
 
         # 启动三级（并行、带提示、每题独立执行器，200步；四级起才开始看提示）
         with stage_lock:
-            tier3_ready = [c for c in tier3 if c not in tier3_threads and not _in_cooldown(c)]
+            tier3_ready = [c for c in tier3 if c not in tier3_threads]
         for code in tier3_ready:
             if _inflight_count() >= MAX_INFLIGHT:
                 break
@@ -1341,7 +1043,6 @@ def main():
                 inflight=inflight,
                 worker_models=worker_models,
                 solver_model=SOLVER_MODEL,
-                local=bool(os.environ.get("CRUISER_LOCAL")),
             )
         except Exception:
             pass
