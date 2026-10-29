@@ -37,6 +37,18 @@ At each tier, `--sessions` **black-box** worker sessions run concurrently on the
 - **Hard context injection (`blackboard_hook.py`)** — writes `.claude/settings.json` into the worker's working directory to register hooks: `SessionStart` injects the challenge description + hint + current blackboard once at the start, and `PostToolUse` injects the latest content every 10 tool calls. The content enters the model context directly through `additionalContext`, so it does not depend on the model choosing to read it.
 - **Blackboard curation watcher** — by default every 4 steps (`CRUISER_WATCHER_EVERY`), a separate watcher LLM reviews the session's recent activity in the background, maintains blackboard quality (extracts new key information, corrects or deletes stale entries), and recommends exploration directions to the task board. On the first successful submission, the submitting session writes a `[flag-method]` entry by itself; the watcher never adds, deletes, or edits these entries. When applying changes, entries are located by fuzzy content match to avoid line-number drift under concurrency. The watcher uses the **`deepseek-v4-pro`** model (override with `WATCHER_MODEL`).
 
+## Session prompts
+
+`cruiser/prompt.py` assembles every session prompt from named parts in `PARTS`, picked per role in `ROLES`:
+
+| Role | Parts |
+|------|-------|
+| explorer (sessions 2..N) | core rules, verifier protocol, shared-ledger protocol, explorer role |
+| lead (session 1) | core rules, verifier protocol, shared-ledger protocol, integration-lead role |
+| solver | core rules, verifier protocol, shared-ledger protocol, solver role |
+
+The core rules are task-agnostic: solve an offline puzzle until the verifier accepts the answer, work only inside the working directory, check claims by running code against the real artifact, do not look the challenge up online (installing packages is fine), and write everything in English. The prompts carry no category techniques. When the session's working root (`CRUISER_CODEX_ROOT` under codex, otherwise the session workspace) contains a `skills/` folder, one more line points the agent at `skills/solve-challenge/SKILL.md`, and the agent opens category skills from there on demand.
+
 ## Project layout
 
 ```
@@ -61,7 +73,7 @@ Cruiser/
 │   ├── llm.py               # LLM providers: solver (DeepSeek) / watcher (deepseek-v4-pro)
 │   ├── dashboard.py         # Dashboard HTTP: snapshot / blackboard / task board / logs
 │   ├── runtime.py           # Scheduler runtime snapshot (read by the dashboard)
-│   ├── prompt.py            # System prompts and task templates
+│   ├── prompt.py            # Prompt parts table and per-role assembly
 │   └── tools.py             # submit_flag, dirsearch/xss and other tools
 ├── resource/                # Username/password/XSS payload wordlists
 ├── kb/                      # Offline vulnerability knowledge base (git submodules: vulhub / nuclei-templates / PayloadsAllTheThings; download the nuclei binary yourself)
@@ -76,7 +88,7 @@ Cruiser/
 > [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings).
 > Clone with `--recurse-submodules` to fetch them (only pointers are stored; upstream files are not bundled into this repo).
 > `kb/bin/nuclei` exceeds GitHub's 100MB per-file limit, so download it yourself from [nuclei Releases](https://github.com/projectdiscovery/nuclei/releases).
-> You can also point `CRUISER_KB_DIR` at an existing knowledge base directory. A missing `kb/` does not affect the main flow; it only reduces local PoC lookup.
+> The session prompts do not point agents at `kb/`, so a missing `kb/` does not affect the main flow.
 
 > **Dashboard**: the scheduler main process serves a dashboard at `http://127.0.0.1:8765` (challenge queue, blackboard, task board, flags, worker logs). You can also open it on its own with `uv run python -m cruiser.dashboard` (it only reads `reports/`). `CRUISER_DASHBOARD=0` turns it off; `CRUISER_DASHBOARD_PORT` / `CRUISER_DASHBOARD_HOST` change the port and listen address.
 
@@ -248,7 +260,6 @@ uv run python main.py --target http://<IP:port> --challenge-code <CODE>
 | `CRUISER_LOG_FILE` | Scheduler log path read by the dashboard (default `/tmp/cruiser.log`) |
 | `CRUISER_MAX_ACTIVE` | Maximum number of challenges running at the same time (default 3) |
 | `CRUISER_CONTAINER_WARMUP` | Upper limit in seconds for the target readiness probe (default 60): after getting the address, the target port is probed actively and sessions start once it accepts connections; on timeout they start anyway and the LLM takes over, to avoid hanging |
-| `CRUISER_KB_DIR` | Offline vulnerability knowledge base directory (default `kb/`; used for nuclei/PoC lookup) |
 | `CRUISER_MAX_TURNS` | Maximum **turns** per claude session (default 0 = unlimited; note that a turn ≠ a log `[COUNT]`; `[COUNT]` is roughly several times the turn count) |
 | `CRUISER_SOLVER_MAX_TURNS` / `CRUISER_MAX_SOLVERS` / `CRUISER_SOLVER_MODEL` | Per-session solver turn limit (default 40) / maximum concurrent solvers per challenge (default 3) / solver model (default `deepseek-v4-flash`) |
 | `CRUISER_SESSIONS` / `CRUISER_WORKER_ID` | Total session count / worker session number (injected into subprocesses automatically) |
@@ -277,6 +288,8 @@ uv run python main.py --target http://<IP:port> --challenge-code <CODE>
 | Smart contracts | Foundry (`forge`/`cast`/`anvil`) / multiple `solc` versions / `slither` / `web3.py` |
 | Offline knowledge base | `kb/`: vulhub / nuclei-templates / PayloadsAllTheThings (local PoC lookup by CVE/component) |
 | `resource/*.txt` | Username / password / XSS payload wordlists |
+
+The session prompts name only `tools/submit_flag.py` and `tools/task_board.py`. The other helpers stay installed for an agent or a skill to call, but no prompt mentions them.
 
 ## Tests
 
