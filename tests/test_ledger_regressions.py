@@ -122,3 +122,13 @@ def test_max_length_digest_leaves_room_for_newest_entries(reports):
     assert "[Newest ledger entries]" in text
     assert "entry number 4" in text
     assert len(text) <= 3000
+
+
+def test_watcher_retires_a_direction_only_by_its_exact_id(reports, run_watcher):
+    assert taskboard.publish_task(CODE, "brute force the admin login")
+    assert taskboard.publish_task(CODE, "read the backup archive")
+    by_text = {t["text"]: t["id"] for t in taskboard.list_tasks(CODE)}
+    run_watcher("2", {"retire_tasks": ["brute force the admin login"]})
+    assert set(t["id"] for t in taskboard.list_tasks(CODE)) == set(by_text.values())
+    run_watcher("2", {"retire_tasks": [by_text["brute force the admin login"]]})
+    assert [t["id"] for t in taskboard.list_tasks(CODE)] == [by_text["read the backup archive"]]

@@ -180,28 +180,18 @@ def claim_task(code: str, worker_id: str, task_id: Optional[str] = None) -> Opti
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def retire_task(code: str, ref: str) -> bool:
-    """For watcher curation: remove a direction from the board. ref is matched exactly by task id (t-xxxxxx) first,
-    otherwise by content similarity. Returns whether anything was actually removed."""
-    ref = (ref or "").strip()
-    if not code or not ref:
+def retire_task(code: str, task_id: str) -> bool:
+    """For watcher curation: remove the pending direction whose id (t-xxxxxx) is exactly task_id.
+    Returns whether anything was actually removed."""
+    if not code or not task_id:
         return False
     os.makedirs(_reports_dir(), exist_ok=True)
-    id_match = re.fullmatch(r"t-[0-9a-f]{6}", ref)
     with open(_lock_path(code), "w", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             lines = _read_lines_unlocked(_tasks_path(code))
-            keep: list[str] = []
-            removed = False
-            for ln in lines:
-                m = _TASK_LINE_RE.match(ln.strip())
-                if m and not removed:
-                    if (id_match and m.group(1) == ref) or (not id_match and _similar(ref, m.group(2).strip())):
-                        removed = True
-                        continue
-                keep.append(ln)
-            if not removed:
+            keep = [ln for ln in lines if (m := _TASK_LINE_RE.match(ln.strip())) is None or m.group(1) != task_id]
+            if len(keep) == len(lines):
                 return False
             _write_lines_atomic(_tasks_path(code), keep)
             return True
