@@ -15,5 +15,6 @@ def current() -> Optional[ModuleType]:
 
 
 def child_env(cwd: str, base: Optional[dict] = None) -> dict:
-    """Environment for a child started with cwd=cwd: opencode resolves its directory from $PWD, not the process cwd."""
-    return {**(os.environ if base is None else base), "PWD": cwd}
+    """Environment for a child started in the workspace cwd: opencode resolves its directory from $PWD,
+    not the process cwd, and prompts point the agent at $CRUISER_WORKSPACE_DIR."""
+    return {**(os.environ if base is None else base), "PWD": cwd, "CRUISER_WORKSPACE_DIR": cwd}

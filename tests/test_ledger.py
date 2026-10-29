@@ -204,8 +204,8 @@ def test_watcher_applies_statuses_by_id_and_never_deletes(reports, tmp_path, mon
                 content = json.dumps(reply)
             return R()
 
-    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
-    claude_agent._watcher_curate_blackboard("T-1", claude_agent.LEAD_SLOT, "Thought: tried things\nAction: shell: ls")
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
+    claude_agent._watcher_curate_blackboard("T-1", claude_agent.LEAD_SLOT, "Thought: tried things\nAction: shell: ls", str(cwd))
     by_id = {f["id"]: f for f in ledger.facts("T-1")}
     assert by_id[lead]["status"] == "disputed" and "0xab5e313b" in by_id[lead]["text"]
     assert by_id[keep]["status"] == "verified"

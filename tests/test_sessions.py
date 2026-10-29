@@ -61,7 +61,7 @@ def test_solver_closing_message_is_recorded_only_when_it_did_not_report(
     monkeypatch.setattr(ledger, "_reports_dir", lambda: str(reports))
     monkeypatch.setattr(taskboard, "_reports_dir", lambda: str(reports))
     monkeypatch.setattr(claude_agent, "_project_root", lambda: str(repo_copy))
-    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: None)
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: None)
     monkeypatch.chdir(repo_copy)
     stub = tmp_path / "engine_stub.py"
     stub.write_text(STUB.format(report=reports_itself))

@@ -200,28 +200,27 @@ def _owns_digest(worker_id: str) -> bool:
     return worker_id in (LEAD_SLOT, SINGLE_WORKER_ID)
 
 
-_WATCHER_LLM = None
+_WATCHER_LLMS: dict[str, object] = {}
 _WATCHER_LLM_LOCK = threading.Lock()
 
 
-def _get_watcher_llm():
-    """Watcher-only LLM singleton (uses DeepSeek deepseek-v4-pro; can be overridden via WATCHER_MODEL)."""
-    global _WATCHER_LLM
-    if _WATCHER_LLM is None:
-        with _WATCHER_LLM_LOCK:
-            if _WATCHER_LLM is None:
-                from . import engines
-                eng = engines.current()
-                if eng is not None:
-                    llm, provider = eng.WatcherLLM(), f"{eng.NAME}:{eng.watcher_model()}"
-                else:
-                    llm, provider, _ = get_watcher_llm()
-                _WATCHER_LLM = llm
-                try:
-                    print(f"[Watcher] backend model: {provider}", flush=True)
-                except Exception:
-                    pass
-    return _WATCHER_LLM
+def _get_watcher_llm(ws_dir: str):
+    """Watcher-only LLM, one per workspace (single mode moves to a new workspace per challenge); an engine
+    watcher runs in that workspace. Without an engine: DeepSeek deepseek-v4-pro, overridable via WATCHER_MODEL."""
+    with _WATCHER_LLM_LOCK:
+        if _WATCHER_LLMS.get(ws_dir) is None:
+            from . import engines
+            eng = engines.current()
+            if eng is not None:
+                llm, provider = eng.WatcherLLM(ws_dir), f"{eng.NAME}:{eng.watcher_model()}"
+            else:
+                llm, provider, _ = get_watcher_llm()
+            _WATCHER_LLMS[ws_dir] = llm
+            try:
+                print(f"[Watcher] backend model: {provider}", flush=True)
+            except Exception:
+                pass
+        return _WATCHER_LLMS[ws_dir]
 
 
 def _format_watcher_activity(recent: deque[str] | list[str], budget: int = _WATCHER_ACTIVITY_CHARS) -> str:
@@ -287,10 +286,10 @@ _FLAG_METHOD_SPAWNED: "set[str]" = set()
 _FLAG_METHOD_SPAWNED_LOCK = threading.Lock()
 
 
-def _compose_flag_method(prog: str, activity: str) -> str:
+def _compose_flag_method(prog: str, activity: str, ws_dir: str) -> str:
     """Condense the activity summary into one complete [flag-method] entry in a single call; falls back to a compressed summary when the LLM is unavailable."""
     activity = redact(activity or "")
-    llm = _get_watcher_llm()
+    llm = _get_watcher_llm(ws_dir)
     _flag_method_dbg(
         f"compose start prog={prog} llm={'yes' if llm is not None else 'None'} "
         f"activity_len={len(activity)}"
@@ -333,11 +332,11 @@ def _compose_flag_method(prog: str, activity: str) -> str:
     return f"[flag-method] progress {prog}. {snippet}"
 
 
-def _write_flag_method_once(code: str, worker_id: str, prog: str, activity: str) -> None:
+def _write_flag_method_once(code: str, worker_id: str, prog: str, activity: str, ws_dir: str) -> None:
     """Forked task: exits after writing one [flag-method] entry."""
     _flag_method_dbg(f"writer thread started worker={worker_id} prog={prog} activity_len={len(activity or '')} ident={threading.current_thread().name}")
     try:
-        info = _compose_flag_method(prog, activity)
+        info = _compose_flag_method(prog, activity, ws_dir)
         if not info:
             _flag_method_dbg(f"writer exit: compose produced an empty draft worker={worker_id} prog={prog}")
             return
@@ -350,7 +349,7 @@ def _write_flag_method_once(code: str, worker_id: str, prog: str, activity: str)
 
 
 def _spawn_flag_method_writer(
-    code: str, worker_id: str, correct: int, total: int, recent_items: list[str]
+    code: str, worker_id: str, correct: int, total: int, recent_items: list[str], ws_dir: str
 ) -> Optional[threading.Thread]:
     """First successful submission: snapshot the activity and hand it to a one-shot thread that is discarded once done. Duplicate submissions never get here."""
     if not code:
@@ -370,7 +369,7 @@ def _spawn_flag_method_writer(
     )
     t = threading.Thread(
         target=_write_flag_method_once,
-        args=(code, worker_id, prog, activity),
+        args=(code, worker_id, prog, activity, ws_dir),
         daemon=True,
         name=f"flag-method-{worker_id}-{prog}",
     )
@@ -528,14 +527,14 @@ def _apply_watcher_reply(code: str, worker_id: str, reply: WatcherReply) -> dict
     }
 
 
-def _watcher_curate_blackboard(code: str, worker_id: str, activity: str) -> None:
+def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir: str) -> None:
     """LLM reviews recent activity and the ledger: appends entries, marks statuses, rewrites the solving-state digest, publishes directions."""
     if not code or not activity.strip():
         return
     try:
         from . import ledger
         from .taskboard import list_claimed, list_tasks
-        llm = _get_watcher_llm()
+        llm = _get_watcher_llm(ws_dir)
         if llm is None:
             return
         owns_digest = _owns_digest(worker_id)
@@ -846,7 +845,7 @@ def _claude_cmd(prompt: str, system_prompt: str, ws_dir: str, resume_id: Optiona
 
 
 def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, quiet: bool, step_counter: list[int],
-                   session: Optional[dict] = None) -> Optional[str]:
+                   session: dict) -> Optional[str]:
     """Consume the engine event stream (claude stream-json shape): count steps, verify flags, trigger the watcher."""
     session_step = 0
     flag_json: Optional[str] = None
@@ -895,7 +894,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
         )
         if fresh:
             t = _spawn_flag_method_writer(
-                code, worker_id, progress["correct"], progress["total"], list(recent)
+                code, worker_id, progress["correct"], progress["total"], list(recent), session["ws"]
             )
             if t is not None:
                 flag_method_threads.append(t)
@@ -950,7 +949,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
                 f"recent_n={len(recent)} text_head={(text or '')[:80]!r}"
             )
             t = _spawn_flag_method_writer(
-                code, worker_id, progress["correct"], progress["total"], list(recent)
+                code, worker_id, progress["correct"], progress["total"], list(recent), session["ws"]
             )
             if t is not None:
                 flag_method_threads.append(t)
@@ -972,7 +971,7 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
     def _watcher_cycle(snapshot: str) -> None:
         try:
             _watcher_try_submit_flags(code, worker_id, snapshot)
-            _watcher_curate_blackboard(code, worker_id, snapshot)
+            _watcher_curate_blackboard(code, worker_id, snapshot, session["ws"])
         except Exception:
             pass
 
@@ -989,18 +988,17 @@ def _drive_session(proc: subprocess.Popen, events, code: str, worker_id: str, qu
     try:
         for evt in events:
             etype = evt.get("type")
-            if etype == "system" and evt.get("session_id") and session and session.get("slot"):
+            if etype == "system" and evt.get("session_id") and session["slot"]:
                 from . import ledger
                 ledger.session_set(code, session["slot"], session["engine"], str(evt["session_id"]), ws=session["ws"])
             elif etype == "assistant":
                 session_step += 1
                 step_counter[0] += 1
-                if session is not None:
-                    session["steps"] = session_step
+                session["steps"] = session_step
                 print(f"[COUNT] {step_counter[0]}", flush=True)
                 msg = evt.get("message") or {}
                 text, tools = _extract_text_and_tools(msg)
-                if session is not None and text.strip():
+                if text.strip():
                     session["last_text"] = text
                 if not quiet:
                     for t in tools:
@@ -1114,7 +1112,6 @@ def run_auto_scan(target: str, max_steps: int = 0, quiet: bool = False, hint: Op
     code = challenge_code or os.environ.get("CRUISER_CHALLENGE_CODE") or ""
     ws_dir = os.environ.get("CRUISER_WORKSPACE_DIR") or workspace_dir(code, worker_id, resumable=not solver_task)
     os.makedirs(ws_dir, exist_ok=True)
-    os.environ["CRUISER_WORKSPACE_DIR"] = ws_dir
 
     # solver directed mode: run only one session, return when done / turn limit reached, no loop
     if solver_task:

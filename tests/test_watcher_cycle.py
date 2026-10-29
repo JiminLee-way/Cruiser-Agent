@@ -77,7 +77,7 @@ def test_each_watcher_cycle_submits_candidates_before_curating(worker, monkeypat
     )
     monkeypatch.setattr(engines, "current", lambda: fake_engine)
     monkeypatch.setattr(tools, "submit_flag_outcome", fake_submit)
-    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda: FakeLLM())
+    monkeypatch.setattr(claude_agent, "_get_watcher_llm", lambda ws_dir: FakeLLM())
     monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", submit)
 
     claude_agent.run_auto_scan("http://t", quiet=True, challenge_code=CODE, solver_task="probe the login form")
@@ -112,7 +112,7 @@ ENGINE_CLI_STUB = textwrap.dedent('''\
 
 
 @pytest.mark.parametrize("engine", ["opencode", "codex"])
-def test_engine_children_run_in_the_workspace_the_worker_chose(worker, monkeypatch, engine):
+def test_engine_children_run_in_the_workspace_the_worker_chose_without_exporting_it(worker, monkeypatch, engine):
     log = worker.tmp / "children.jsonl"
     bin_dir = worker.tmp / "bin"
     bin_dir.mkdir()
@@ -122,7 +122,6 @@ def test_engine_children_run_in_the_workspace_the_worker_chose(worker, monkeypat
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("CRUISER_ENGINE", engine)
     monkeypatch.setenv("CRUISER_WATCHER_SUBMIT", "0")
-    monkeypatch.setattr(claude_agent, "_WATCHER_LLM", None)
 
     claude_agent.run_auto_scan("http://t", quiet=True, challenge_code=CODE, solver_task="look around")
 
@@ -132,4 +131,5 @@ def test_engine_children_run_in_the_workspace_the_worker_chose(worker, monkeypat
     assert os.path.dirname(workspace) == os.path.realpath(worker.tmp / "workspaces")
     assert session["cwd"] == workspace and os.path.realpath(session["env_ws"]) == workspace
     assert watcher["dir"] == workspace
+    assert "CRUISER_WORKSPACE_DIR" not in os.environ
     assert [f["text"] for f in ledger.facts(CODE)] == ["lead: the stub engine ran"]
