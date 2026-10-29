@@ -1,8 +1,6 @@
 """Exploration-direction task board: the watcher publishes directions, workers claim them (claiming erases them) and report back.
 
-One file per challenge, reports/tasks_<code>.txt, line format:
-    [t-xxxxxx] direction text (one line)[ (from f-a, r-b)]
-where the optional suffix names the live ledger entries the direction follows from.
+One file per challenge, reports/tasks_<code>.txt.
 All reads and writes happen under a file lock; rewrites go through a temp file + atomic os.replace,
 so when several workers claim the same direction concurrently only one succeeds.
 """
@@ -91,8 +89,6 @@ def _direction(m: re.Match) -> dict:
 
 
 def list_tasks(code: str) -> list[dict]:
-    """Return the list of pending directions: [{"id": "t-xxxxxx", "text": "...", "basis_ids": [...]}].
-    text is the whole line after the id, basis suffix included, as solvers and dedup see it."""
     if not code:
         return []
     return [_direction(m) for ln in _read_lines_unlocked(_tasks_path(code)) if (m := _TASK_LINE_RE.match(ln.strip()))]
@@ -121,8 +117,7 @@ def list_claimed(code: str, ttl_s: float = _CLAIMED_TTL_S) -> list[dict]:
 
 
 def publish_task(code: str, text: str, basis_ids: Iterable[str] = ()) -> bool:
-    """Watcher publishes a direction: deduplicated against "pending board + recently claimed"; nothing is published when the board is full (>=5).
-    Only basis ids of live ledger entries are kept. Returns whether anything was actually written."""
+    """Watcher publishes a direction: deduplicated against "pending board + recently claimed"; nothing is published when the board is full (>=5)."""
     text = redact(text).strip()
     if not code or not text:
         return False
@@ -187,8 +182,6 @@ def claim_task(code: str, worker_id: str, task_id: Optional[str] = None) -> Opti
 
 
 def retire_task(code: str, task_id: str) -> bool:
-    """For watcher curation: remove the pending direction whose id (t-xxxxxx) is exactly task_id.
-    Returns whether anything was actually removed."""
     if not code or not task_id:
         return False
     os.makedirs(_reports_dir(), exist_ok=True)

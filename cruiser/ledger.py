@@ -371,7 +371,6 @@ def context_text(code: str, budget: int = 3000) -> str:
     digest_text = (led.digest or {}).get("text", "")
     if not live and not digest_text:
         return ""
-    # shown <= len(live), so the line written with len(live) is the longest it can get
     reserve = len(_totals(code, live, len(live))) + 1
     body, shown = _fit_context(digest_text, ["- " + _view_line(e) for e in live], budget - reserve)
     return "\n".join(filter(None, [_totals(code, live, shown), body]))

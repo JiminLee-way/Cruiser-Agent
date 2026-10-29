@@ -436,9 +436,13 @@ def _watcher_try_submit_flags(code: str, worker_id: str, *texts: str) -> Optiona
     return last_js
 
 
-def _format_ledger_for_watcher(code: str, since: str = "") -> tuple[str, str, str]:
-    """Watcher view: (entries newer than `since`, older entries, older task results), keeping the newest part when over budget.
-    With no `since` every entry counts as older."""
+class WatcherView(NamedTuple):
+    new: str
+    facts: str
+    results: str
+
+
+def _format_ledger_for_watcher(code: str, since: str = "") -> WatcherView:
     from . import ledger
 
     def _tail(e: dict) -> str:
@@ -457,9 +461,11 @@ def _format_ledger_for_watcher(code: str, since: str = "") -> tuple[str, str, st
     new = sorted((e for e in facts + results if _new(e)), key=lambda e: e["ts"])
     old_facts = [e for e in facts if not _new(e)]
     old_results = [e for e in results if not _new(e)][-12:]
-    return (("\n".join(map(_row, new)) or "(none)")[-_WATCHER_BB_CHARS:],
-            ("\n".join(map(_row, old_facts)) or "(empty)")[-_WATCHER_BB_CHARS:],
-            ("\n".join(map(_row, old_results)) or "(empty)")[-_WATCHER_TASKS_CHARS:])
+    return WatcherView(
+        new=("\n".join(map(_row, new)) or "(none)")[-_WATCHER_BB_CHARS:],
+        facts=("\n".join(map(_row, old_facts)) or "(empty)")[-_WATCHER_BB_CHARS:],
+        results=("\n".join(map(_row, old_results)) or "(empty)")[-_WATCHER_TASKS_CHARS:],
+    )
 
 
 class Dispute(NamedTuple):
@@ -578,7 +584,7 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir:
             return
         owns_digest = _owns_digest(worker_id)
         since = ledger.digest_ts(code) if owns_digest else ""
-        new_text, facts_text, results_text = _format_ledger_for_watcher(code, since)
+        view = _format_ledger_for_watcher(code, since)
         pending_tasks = list_tasks(code)
         claimed_tasks = list_claimed(code)
         tasks_text = "\n".join(f"- [{t['id']}] {t['text']}" for t in pending_tasks) or "(empty)"
@@ -587,12 +593,12 @@ def _watcher_curate_blackboard(code: str, worker_id: str, activity: str, ws_dir:
             _WATCHER_PROMPT_TEMPLATE
             .replace("{{", "{").replace("}}", "}")
             .replace("{activity}", activity[-_WATCHER_ACTIVITY_CHARS:])
-            .replace("{blackboard}", facts_text)
-            .replace("{results}", results_text)
+            .replace("{blackboard}", view.facts)
+            .replace("{results}", view.results)
             .replace("{digest}", ledger.digest(code) or "(none yet)")
             .replace("{tasks}", tasks_text[-_WATCHER_TASKS_CHARS:])
             .replace("{claimed_tasks}", claimed_text[-_WATCHER_CLAIMED_CHARS:])
-            .replace("{new_since}", f"[New since the last digest ({since})]\n{new_text}\n\n" if since else "")
+            .replace("{new_since}", f"[New since the last digest ({since})]\n{view.new}\n\n" if since else "")
         )
         prompt += _WATCHER_DIGEST_TAIL[owns_digest]
         # challenge description + hint (if fetched): lets the watcher use them to maintain the ledger and publish better-fitting exploration directions
